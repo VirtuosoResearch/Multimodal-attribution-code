@@ -1,0 +1,21 @@
+#--------- Example config ---------
+# Unimodal training
+ds_name: ['sarcasm']
+modality: ['x']
+num_epochs: [30]
+lr: [1.0e-4, 1.0e-3, 1.0e-5]
+zdim: [20, 40, 150, 300]
+n_seeds: [3]
+pos_embd: [true, false]
+pos_learnable: [true, false]
+
+# Multimodal training
+ds_name: ['sarcasm']
+modality: ['xy']
+num_epochs: [30]
+lr: [1.0e-4, 1.0e-3, 1.0e-5]
+zdim: [20, 40, 150, 300]
+step_k: [-1, 10, 15, 20]
+n_seeds: [3]
+pos_embd: [true, false]
+pos_learnable: [true, false]

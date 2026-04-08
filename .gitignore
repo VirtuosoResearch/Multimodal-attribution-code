@@ -1,0 +1,8 @@
+*.pdf
+.claude
+__pycache__/
+*.pyc
+syn/results/
+results/
+results_*
+.codex
