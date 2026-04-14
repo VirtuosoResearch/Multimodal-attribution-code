@@ -6,3 +6,6 @@ syn/results/
 results/
 results_*
 .codex
+CLAUDE.md
+features/
+data/

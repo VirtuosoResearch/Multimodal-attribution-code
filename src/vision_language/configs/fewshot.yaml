@@ -1,0 +1,3 @@
+dataset: ['fgvc_aircraft']
+train_shot: [1]
+seed: [1]

@@ -1,0 +1,19 @@
+dataset: ['fgvc_aircraft']
+train_shot: [-1]
+seed: [1]
+vision_model: ['vit_small_patch14_dinov2.lvd142m']
+language_model: ['openlm-research/open_llama_3b_v2']
+hyperparams: ['full_ds_full_model_finetune']
+image_augmentation: ['crop']
+logit: [4.60517]
+custom_name: ['']
+num_workers: [4]
+eval_test: [True]
+
+#----------- Crossmodal Settings -----------
+text_type: ['gpt3_cupl']
+text_shot: ['average', 15]
+modality: ['crossmodal']
+alpha:  [0.2, 0.5, 0.7, 1.0, 1.5]
+classifier_init: ['zeroshot', 'random']
+
