@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 from src.fisher_geometry.models import (
     ConcatFusionModel,
     CrossAttentionFusionModel,
+    SharedMLPFusionModel,
 )
 from src.fisher_geometry.fisher_metrics import (
     compute_loss,
@@ -150,6 +151,10 @@ def build_model(model_type: str, dim_x: int, dim_y: int,
         return ConcatFusionModel(
             dim_x, dim_y, hidden_dim=args.hidden_dim,
             num_classes=num_classes, dropout=args.dropout)
+    elif model_type == "shared_mlp":
+        return SharedMLPFusionModel(
+            dim_x, dim_y, hidden_dim=args.hidden_dim,
+            num_classes=num_classes, dropout=args.dropout)
     elif model_type == "cross_attention":
         return CrossAttentionFusionModel(
             dim_x, dim_y, proj_dim=args.proj_dim,
@@ -225,18 +230,30 @@ def _train_and_measure(
         acc = evaluate(m, data["val_x"], data["val_y"], data["val_labels"],
                        device=device, batch_size=512, task=task,
                        use_x=True, use_y=use_y_train)
+        # Y-only and X-only baselines for label leakage check
+        acc_x_only = evaluate(m, data["val_x"], data["val_y"],
+                              data["val_labels"], device=device,
+                              batch_size=512, task=task,
+                              use_x=True, use_y=False)
+        acc_y_only = evaluate(m, data["val_x"], data["val_y"],
+                              data["val_labels"], device=device,
+                              batch_size=512, task=task,
+                              use_x=False, use_y=True)
+
+        # Cap fisher_samples to actual validation size
+        actual_fisher = min(fisher_samples, data["val_x"].shape[0])
 
         gx = per_example_gradients(
             m, data["val_x"], data["val_y"], data["val_labels"],
-            device=device, max_samples=fisher_samples, task=task,
+            device=device, max_samples=actual_fisher, task=task,
             use_x=True, use_y=False)
         gy = per_example_gradients(
             m, data["val_x"], data["val_y"], data["val_labels"],
-            device=device, max_samples=fisher_samples, task=task,
+            device=device, max_samples=actual_fisher, task=task,
             use_x=False, use_y=use_y_train)
         gxy = per_example_gradients(
             m, data["val_x"], data["val_y"], data["val_labels"],
-            device=device, max_samples=fisher_samples, task=task,
+            device=device, max_samples=actual_fisher, task=task,
             use_x=True, use_y=use_y_train)
 
         fx = fisher_eigen(gx, top_k=top_k)
@@ -246,6 +263,9 @@ def _train_and_measure(
         metrics.append({
             "fraction": ckpt.fraction,
             "acc_xy": acc,
+            "acc_x_only": acc_x_only,
+            "acc_y_only": acc_y_only,
+            "fisher_samples_used": actual_fisher,
             "F_X_trace": fx["trace"],
             "F_Y_trace": fy["trace"],
             "F_XY_trace": fxy["trace"],
@@ -270,14 +290,45 @@ def _train_and_measure(
 
 
 # ---------------------------------------------------------------------------
+# Average multiple unrelated arm runs (different permutation seeds)
+# ---------------------------------------------------------------------------
+
+def _average_arm_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Average checkpoint metrics across multiple unrelated arm runs."""
+    if len(runs) == 1:
+        return runs[0]
+    # All runs should have the same number of checkpoints
+    n_ckpts = len(runs[0]["checkpoints"])
+    averaged_ckpts = []
+    for ci in range(n_ckpts):
+        merged = {}
+        for key in runs[0]["checkpoints"][ci]:
+            vals = [r["checkpoints"][ci][key] for r in runs]
+            if isinstance(vals[0], (int, float)):
+                merged[key] = float(np.mean(vals))
+            else:
+                merged[key] = vals[0]  # non-numeric: take first
+        averaged_ckpts.append(merged)
+    return {"arm": "C_unrelated", "checkpoints": averaged_ckpts}
+
+
+# ---------------------------------------------------------------------------
 # Single-dataset driver
 # ---------------------------------------------------------------------------
 
 def run_single(dataset_name: str, seed: int,
                args: argparse.Namespace) -> dict[str, Any]:
     print(f"\n  [{dataset_name}] seed={seed}: loading data...")
-    data_related = load_dataset(dataset_name, seed)
-    data_unrelated = permute_aux(data_related, seed + 1000)
+    data_related = load_dataset(
+        dataset_name,
+        seed,
+        text_backbone=args.text_backbone,
+        vision_backbone=args.vision_backbone,
+        feature_device=args.feature_device,
+        backbone_batch_size=args.backbone_batch_size,
+        download_datasets=args.download_datasets,
+        backbone_cache_dir=args.backbone_cache_dir,
+    )
 
     kw = dict(model_type=args.model, device=args.device, args=args,
               fisher_samples=args.fisher_samples,
@@ -289,9 +340,19 @@ def run_single(dataset_name: str, seed: int,
     print(f"  [{dataset_name}] seed={seed}: arm C_related...")
     arm_rel = _train_and_measure(data_related, arm_name="C_related",
                                  seed=seed + 200, **kw)
-    print(f"  [{dataset_name}] seed={seed}: arm C_unrelated...")
-    arm_unrel = _train_and_measure(data_unrelated, arm_name="C_unrelated",
-                                   seed=seed + 300, **kw)
+
+    # Multiple permutation seeds for unrelated arm (Concern 7)
+    perm_seeds = [seed + 1000, seed + 2000, seed + 3000]
+    unrel_runs = []
+    for pi, ps in enumerate(perm_seeds):
+        data_unrelated = permute_aux(data_related, ps)
+        print(f"  [{dataset_name}] seed={seed}: arm C_unrelated "
+              f"(perm {pi+1}/{len(perm_seeds)})...")
+        run = _train_and_measure(data_unrelated, arm_name="C_unrelated",
+                                 seed=seed + 300 + pi * 10, **kw)
+        unrel_runs.append(run)
+    # Average the unrelated runs' checkpoint metrics
+    arm_unrel = _average_arm_runs(unrel_runs)
 
     def _final(arm):
         return arm["checkpoints"][-1] if arm["checkpoints"] else {}
@@ -311,9 +372,19 @@ def run_single(dataset_name: str, seed: int,
         "C_related_acc": rf.get("acc_xy", 0),
         "C_unrelated_acc": uf.get("acc_xy", 0),
         "B_acc": bf.get("acc_xy", 0),
+        # Label leakage check (Concern 1)
+        "C_related_acc_x_only": rf.get("acc_x_only", 0),
+        "C_related_acc_y_only": rf.get("acc_y_only", 0),
+        "fisher_samples_used": rf.get("fisher_samples_used", 0),
+        # Metric type for clarity (Concern 8)
+        "metric_type": "micro-F1" if data_related["task"] == "multilabel"
+                       else "accuracy",
+        "num_perm_seeds": len(perm_seeds),
     }
     return {
         "dataset": dataset_name, "seed": seed, "model": args.model,
+        "text_backbone": args.text_backbone,
+        "vision_backbone": args.vision_backbone,
         "top_k": args.top_k,
         "arms": {"B": arm_b, "C_related": arm_rel, "C_unrelated": arm_unrel},
         "summary": summary,
@@ -327,13 +398,19 @@ def run_single(dataset_name: str, seed: int,
 def main():
     parser = argparse.ArgumentParser(
         description="Fisher Geometry: compare Concat-MLP vs Cross-Attention")
-    parser.add_argument("--model", choices=["concat_mlp", "cross_attention"],
+    parser.add_argument("--model", choices=["concat_mlp", "shared_mlp", "cross_attention"],
                         default="cross_attention")
     parser.add_argument("--datasets", nargs="+",
                         default=["food101", "oxford_pets", "imdb",
                                  "humor", "sarcasm"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--feature-device", default="cuda:0")
+    parser.add_argument("--text-backbone", default="clip_cached")
+    parser.add_argument("--vision-backbone", default="clip_cached")
+    parser.add_argument("--backbone-batch-size", type=int, default=32)
+    parser.add_argument("--download-datasets", action="store_true")
+    parser.add_argument("--backbone-cache-dir", default=None)
     # Shared
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -375,24 +452,33 @@ def main():
     print(f"FISHER GEOMETRY — {args.model} (final checkpoint, "
           f"averaged over seeds)")
     print(f"{'='*130}")
-    hdr = (f"{'Dataset':<15} {'acc_R':>8} {'acc_U':>8} {'acc_B':>8} | "
+    hdr = (f"{'Dataset':<15} {'acc_XY':>8} {'acc_U':>8} {'acc_B':>8} "
+           f"{'Xonly':>8} {'Yonly':>8} | "
            f"{'cos_R':>8} {'cos_U':>8} | "
            f"{'overlap_R':>10} {'overlap_U':>10} | "
            f"{'resid_R':>8} {'resid_U':>8} | "
            f"{'topk_R':>8} {'topk_U':>8}")
     print(hdr)
-    print("-" * 130)
+    print("-" * 145)
 
     for ds in args.datasets:
         rs = [r for r in all_results if r["dataset"] == ds]
         if not rs:
             continue
-        s = {k: np.mean([r["summary"][k] for r in rs])
-             for k in rs[0]["summary"]}
+        s = {}
+        for k in rs[0]["summary"]:
+            vals = [r["summary"][k] for r in rs]
+            if isinstance(vals[0], (int, float)):
+                s[k] = float(np.mean(vals))
+            else:
+                s[k] = vals[0]
+        metric_label = s.get("metric_type", "acc")
         print(
             f"{ds:<15} "
             f"{s['C_related_acc']:8.4f} {s['C_unrelated_acc']:8.4f} "
-            f"{s['B_acc']:8.4f} | "
+            f"{s['B_acc']:8.4f} "
+            f"{s.get('C_related_acc_x_only',0):8.4f} "
+            f"{s.get('C_related_acc_y_only',0):8.4f} | "
             f"{s['C_related_mean_sample_cos']:8.4f} "
             f"{s['C_unrelated_mean_sample_cos']:8.4f} | "
             f"{s['C_related_subspace_overlap']:10.4f} "
@@ -400,7 +486,8 @@ def main():
             f"{s['C_related_residual_energy']:8.4f} "
             f"{s['C_unrelated_residual_energy']:8.4f} | "
             f"{s['C_related_topk_mass_XY']:8.4f} "
-            f"{s['C_unrelated_topk_mass_XY']:8.4f}")
+            f"{s['C_unrelated_topk_mass_XY']:8.4f} "
+            f" [{metric_label}]")
 
 
 if __name__ == "__main__":

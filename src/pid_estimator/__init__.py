@@ -44,6 +44,8 @@ from .lsmi import (
 )
 from .surrogate import (
     CalibrationRecord,
+    KernelHeadQueryEngine,
+    KernelPIDHead,
     RedundancyHead,
     SurrogatePIDConfig,
     SurrogatePIDResult,
@@ -60,6 +62,8 @@ __all__ = [
     "CEAlignmentInformation",
     "Discrim",
     "EncoderAndHead",
+    "KernelHeadQueryEngine",
+    "KernelPIDHead",
     "LSMIConfig",
     "LSMIEstimateResult",
     "MM",

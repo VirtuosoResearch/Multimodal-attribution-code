@@ -12,7 +12,6 @@ from torch.nn import functional as F
 sys.path.append(os.getcwd())
 
 import torch
-import torchtext as text
 from collections import defaultdict
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
@@ -118,6 +117,12 @@ def _get_word2id(text_data, vids):
 
 
 def _get_word_embeddings(word2id, save=False):
+    try:
+        import torchtext as text
+    except ImportError as exc:
+        raise ImportError(
+            "torchtext is required for robust text augmentation in affect datasets."
+        ) from exc
     vec = text.vocab.GloVe(name='840B', dim=300)
     tokens = []
     for w, _ in word2id.items():
