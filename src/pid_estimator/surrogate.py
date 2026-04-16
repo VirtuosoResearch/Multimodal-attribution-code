@@ -457,14 +457,22 @@ def _fit_mobius_head(
         )
         calibration_loss = F.mse_loss(calibration_predictions, record_targets)
         mobius_prior_loss = _mobius_prior_loss(predictive_scores, redundancy_head)
-        loss = calibration_loss + config.lambda_mobius_prior * mobius_prior_loss
+        semantic_loss = _semantic_loss(pointwise, predictive_scores)
+        nonnegative_loss = _nonnegative_loss(pointwise)
+        loss = (
+            calibration_loss
+            + config.lambda_mobius_prior * mobius_prior_loss
+            + config.lambda_semantic * semantic_loss
+            + config.lambda_nonnegative * nonnegative_loss
+        )
         loss.backward()
         optimizer.step()
         if config.verbose and (epoch + 1) % 50 == 0:
             print(
                 "[surrogate/mobius] "
                 f"epoch={epoch + 1} calib={calibration_loss.item():.4f} "
-                f"prior={mobius_prior_loss.item():.4f}"
+                f"prior={mobius_prior_loss.item():.4f} "
+                f"sem={semantic_loss.item():.4f} nonneg={nonnegative_loss.item():.4f}"
             )
     redundancy_head.eval()
 
@@ -556,14 +564,22 @@ def _fit_uncertainty_mobius_head(
         )
         calibration_loss = F.mse_loss(calibration_predictions, record_targets)
         uncertainty_prior_loss = _uncertainty_mobius_prior_loss(predictive_scores, redundancy_head)
-        loss = calibration_loss + config.lambda_mobius_prior * uncertainty_prior_loss
+        semantic_loss = _semantic_loss(pointwise, predictive_scores)
+        nonnegative_loss = _nonnegative_loss(pointwise)
+        loss = (
+            calibration_loss
+            + config.lambda_mobius_prior * uncertainty_prior_loss
+            + config.lambda_semantic * semantic_loss
+            + config.lambda_nonnegative * nonnegative_loss
+        )
         loss.backward()
         optimizer.step()
         if config.verbose and (epoch + 1) % 50 == 0:
             print(
                 "[surrogate/uncertainty_mobius] "
                 f"epoch={epoch + 1} calib={calibration_loss.item():.4f} "
-                f"prior={uncertainty_prior_loss.item():.4f}"
+                f"prior={uncertainty_prior_loss.item():.4f} "
+                f"sem={semantic_loss.item():.4f} nonneg={nonnegative_loss.item():.4f}"
             )
     redundancy_head.eval()
 

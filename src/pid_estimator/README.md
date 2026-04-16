@@ -36,7 +36,7 @@ synthetic data 生成示例：
 ```python
 from pid_estimator import SyntheticGenerationConfig, generate_synthetic_dataset
 
-config = SyntheticGenerationConfig(setting="synergy", num_data=4096, seed=0)
+config = SyntheticGenerationConfig(setting="official", rho=0.5, noise_degree=0.5, num_data=4096, seed=0)
 data = generate_synthetic_dataset(config)
 print(data["train"]["0"].shape, data["train"]["label"].shape)
 ```

@@ -52,6 +52,12 @@ from .surrogate import (
     SurrogateQueryEngine,
     estimate_surrogate_pid,
 )
+from .direct_kernel import (
+    DirectKernelPIDConfig,
+    DirectKernelPIDResult,
+    DirectKernelQueryEngine,
+    estimate_direct_kernel_pid,
+)
 
 
 __all__ = [
@@ -72,6 +78,9 @@ __all__ = [
     "PIDEstimateResult",
     "RedundancyHead",
     "ClassificationNetwork",
+    "DirectKernelPIDConfig",
+    "DirectKernelPIDResult",
+    "DirectKernelQueryEngine",
     "SyntheticDataset",
     "SyntheticGenerationConfig",
     "SurrogatePIDConfig",
@@ -81,6 +90,7 @@ __all__ = [
     "critic_ce_alignment",
     "enumerate_alignments",
     "estimate_lsmi",
+    "estimate_direct_kernel_pid",
     "estimate_pid_with_ce_alignment",
     "estimate_surrogate_pid",
     "generate_synthetic_dataset",

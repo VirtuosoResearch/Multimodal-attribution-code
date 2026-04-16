@@ -10,6 +10,7 @@ import torch
 
 from pid_estimator.ce_alignment import CEAlignmentConfig, estimate_pid_with_ce_alignment
 from pid_estimator.data import MultimodalDataset
+from pid_estimator.direct_kernel import DirectKernelPIDConfig, estimate_direct_kernel_pid
 from pid_estimator.lsmi import LSMIConfig, estimate_lsmi
 from pid_estimator.surrogate import SurrogatePIDConfig, estimate_surrogate_pid
 from pid_estimator.synthetic_data import (
@@ -26,8 +27,10 @@ def main() -> None:
     parser.add_argument("--feature-dim", type=int, default=5)
     parser.add_argument("--transform-dim", type=int, default=16)
     parser.add_argument("--feature-sep", type=float, default=1.5)
+    parser.add_argument("--rho", type=float, default=0.5)
+    parser.add_argument("--noise-degree", type=float, default=0.5)
     parser.add_argument("--logic-repeat", type=int, default=2048)
-    parser.add_argument("--logic-cases", nargs="+", default=["redundant", "unique1", "xor"])
+    parser.add_argument("--logic-cases", nargs="+", default=["redundant", "unique0", "unique1", "xor"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--pid-batch-size", type=int, default=64)
@@ -44,6 +47,16 @@ def main() -> None:
     parser.add_argument("--surrogate-calibration-subsets", type=int, default=10)
     parser.add_argument("--surrogate-reference-lsmi-discriminator-epochs", type=int, default=20)
     parser.add_argument("--surrogate-reference-lsmi-entropy-epochs", type=int, default=20)
+    parser.add_argument("--direct-kernel-family", type=str, default="rbf")
+    parser.add_argument("--direct-kernel-gamma", type=float, default=None)
+    parser.add_argument("--direct-kernel-ridge-lambda", type=float, default=1e-2)
+    parser.add_argument("--direct-kernel-refinement-epochs", type=int, default=100)
+    parser.add_argument("--direct-kernel-refinement-lr", type=float, default=5e-2)
+    parser.add_argument("--direct-kernel-lambda-anchor", type=float, default=0.0)
+    parser.add_argument("--direct-kernel-lambda-info", type=float, default=0.0)
+    parser.add_argument("--direct-kernel-lambda-redundancy", type=float, default=2.5)
+    parser.add_argument("--direct-kernel-lambda-interval", type=float, default=0.0)
+    parser.add_argument("--direct-kernel-lambda-rkhs", type=float, default=0.0)
     parser.add_argument(
         "--lsmi-cache-json",
         type=str,
@@ -53,7 +66,7 @@ def main() -> None:
     parser.add_argument(
         "--settings",
         nargs="+",
-        default=["redundancy", "uniqueness0", "uniqueness1", "synergy"],
+        default=["official"],
     )
     parser.add_argument(
         "--output-json",
@@ -80,6 +93,8 @@ def main() -> None:
             feature_dim=args.feature_dim,
             transform_dim=args.transform_dim,
             feature_sep=args.feature_sep,
+            rho=args.rho,
+            noise_degree=args.noise_degree,
             setting=setting,
             seed=args.seed + offset,
         )
@@ -312,6 +327,31 @@ def _run_estimators(
         ),
         device=device,
     )
+    direct_kernel_result = estimate_direct_kernel_pid(
+        x1_train,
+        x2_train,
+        y_train,
+        num_labels=num_labels,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        config=DirectKernelPIDConfig(
+            batch_size=args.surrogate_batch_size,
+            predictor_epochs=args.surrogate_predictor_epochs,
+            kernel=args.direct_kernel_family,
+            kernel_gamma=args.direct_kernel_gamma,
+            ridge_lambda=args.direct_kernel_ridge_lambda,
+            refinement_epochs=args.direct_kernel_refinement_epochs,
+            refinement_lr=args.direct_kernel_refinement_lr,
+            lambda_anchor=args.direct_kernel_lambda_anchor,
+            lambda_info=args.direct_kernel_lambda_info,
+            lambda_redundancy=args.direct_kernel_lambda_redundancy,
+            lambda_interval=args.direct_kernel_lambda_interval,
+            lambda_rkhs=args.direct_kernel_lambda_rkhs,
+            calibration_blocks=args.surrogate_calibration_blocks,
+            seed=seed,
+        ),
+        device=device,
+    )
     return {
         "pid_ce_alignment": _components_to_dict(pid_result.mean_components),
         "lsmi": lsmi_result_dict,
@@ -319,6 +359,7 @@ def _run_estimators(
         "surrogate_mobius": _components_to_dict(surrogate_mobius_result.mean_components),
         "surrogate_uncertainty_mobius": _components_to_dict(surrogate_uncertainty_mobius_result.mean_components),
         "surrogate_kernel": _components_to_dict(surrogate_kernel_result.mean_components),
+        "direct_kernel": _components_to_dict(direct_kernel_result.mean_components),
     }
 
 
@@ -478,6 +519,7 @@ def _format_rows(*, row_key: str, row: dict) -> list[str]:
         ("surrogate_mobius", "surrogate-mobius"),
         ("surrogate_uncertainty_mobius", "surrogate-uncertainty-mobius"),
         ("surrogate_kernel", "surrogate-kernel"),
+        ("direct_kernel", "direct-kernel"),
     ]:
         values = row[estimator_key]
         dominant = _dominant_component(values)

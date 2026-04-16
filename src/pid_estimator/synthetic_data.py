@@ -1,19 +1,14 @@
 from __future__ import annotations
 
 import math
-from collections import namedtuple
 from dataclasses import dataclass
 from itertools import chain, combinations, permutations
 from typing import Any
 
 import numpy as np
 import torch
-from sklearn.model_selection import train_test_split
 
 from .data import MultimodalDataset, load_pickle_dataset, save_pickle_dataset
-
-
-DimInfo = namedtuple("DimInfo", ["dim", "sep"])
 
 _BINARY_X1 = np.array([[0], [0], [1], [1]], dtype=np.int64)
 _BINARY_X2 = np.array([[0], [1], [0], [1]], dtype=np.int64)
@@ -23,7 +18,8 @@ BINARY_LOGIC_CASES: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {
     "and": (_BINARY_X1, _BINARY_X2, np.logical_and(_BINARY_X1, _BINARY_X2).astype(np.int64)),
     "or": (_BINARY_X1, _BINARY_X2, np.logical_or(_BINARY_X1, _BINARY_X2).astype(np.int64)),
     "xor": (_BINARY_X1, _BINARY_X2, np.logical_xor(_BINARY_X1, _BINARY_X2).astype(np.int64)),
-    "unique1": (_BINARY_X1, _BINARY_X2, _BINARY_X1.copy()),
+    "unique0": (_BINARY_X1, _BINARY_X2, _BINARY_X1.copy()),
+    "unique1": (_BINARY_X1, _BINARY_X2, _BINARY_X2.copy()),
     "redundant": (_BINARY_X1, _BINARY_X1.copy(), _BINARY_X1.copy()),
     "redundant_and_unique1": (
         np.concatenate([_BINARY_X1, _BINARY_X2], axis=1),
@@ -50,7 +46,9 @@ class SyntheticGenerationConfig:
     feature_dim: int = 5
     feature_sep: float = 1.5
     transform_dim: int = 32
-    setting: str = "redundancy"
+    setting: str = "official"
+    rho: float = 0.5
+    noise_degree: float = 0.5
     mix_ratio: tuple[float, ...] | None = None
     num_classes: int = 32
     train_size: float = 0.7
@@ -59,123 +57,85 @@ class SyntheticGenerationConfig:
 
 
 def generate_synthetic_dataset(config: SyntheticGenerationConfig) -> dict[str, dict[str, np.ndarray]]:
-    rng = np.random.default_rng(config.seed)
-    intersections = _intersection_keys(config.modality_number)
-    feature_dim = [config.feature_dim] * len(intersections)
-    dim_info = {
-        "redundancy": [0, 0, 1],
-        "uniqueness0": [1, 0, 0],
-        "uniqueness1": [0, 1, 0],
-        "synergy": [1, 1, 0],
-    }
+    if config.modality_number != 2:
+        raise ValueError("Official LSMI synthetic generator only supports modality_number=2.")
+    if config.setting != "official":
+        raise ValueError(
+            f"Unsupported synthetic setting {config.setting!r}. "
+            "Use setting='official' for the official LSMI Gaussian generator, "
+            "or use make_binary_logic_dataset for logic PID cases."
+        )
 
-    if config.setting in dim_info:
-        label_dim = np.array(dim_info[config.setting]) * np.array(feature_dim)
-        feature_dim_info = {
-            name: DimInfo(dim=feature_dim[index], sep=config.feature_sep)
-            for index, name in enumerate(intersections)
-        }
-        label_dim_info = {name: int(label_dim[index]) for index, name in enumerate(intersections)}
-    else:
-        if config.mix_ratio is None:
-            mix_ratio = rng.random(len(intersections))
-        else:
-            mix_ratio = np.asarray(config.mix_ratio, dtype=np.float64)
-        if len(mix_ratio) != len(intersections):
-            raise ValueError("mix_ratio length must match the number of modality intersections")
-        feature_dim_info = {
-            name: DimInfo(dim=feature_dim[index], sep=config.feature_sep)
-            for index, name in enumerate(intersections)
-        }
-        label_dim_info = None
+    total = int(config.num_data)
+    train_count = max(1, int(round(total * config.train_size)))
+    valid_count = max(1, int(round(total * config.valid_size)))
+    if train_count + valid_count >= total:
+        valid_count = max(1, total - train_count - 1)
+    test_count = max(1, total - train_count - valid_count)
 
-    total_data = [[] for _ in range(config.modality_number)]
-    total_labels: list[list[int]] = []
+    rng_train = np.random.default_rng(config.seed)
+    rng_valid = np.random.default_rng(config.seed + 1)
+    rng_test = np.random.default_rng(config.seed + 2)
 
-    transforms = {
-        name: rng.uniform(0.0, 1.0, (feature_dim_info[name].dim, config.transform_dim))
-        for name in intersections
-    }
-
-    dataset: list[tuple[float, list[np.ndarray]]] = []
-    for _ in range(config.num_data):
-        raw_features = {
-            name: rng.multivariate_normal(
-                mean=np.zeros((feature_dim_info[name].dim,), dtype=np.float64),
-                cov=np.eye(feature_dim_info[name].dim, dtype=np.float64) * feature_dim_info[name].sep,
-                size=1,
-            )[0]
-            for name in feature_dim_info
-        }
-
-        modality_data = []
-        for modality_index in range(config.modality_number):
-            chunks = []
-            for key, values in raw_features.items():
-                if str(modality_index) in key:
-                    chunks.append(values @ transforms[key])
-            modality_data.append(np.concatenate(chunks, axis=0))
-
-        label_components = []
-        if label_dim_info is not None:
-            for key, dim in label_dim_info.items():
-                label_components.append(raw_features[key][:dim])
-        else:
-            for ratio, key in zip(mix_ratio, intersections):
-                size = int(ratio * len(raw_features[key]))
-                if size <= 0:
-                    continue
-                indices = np.sort(rng.choice(np.arange(len(raw_features[key])), size=size, replace=False))
-                label_components.append(raw_features[key][indices])
-
-        label_vector = np.concatenate(label_components, axis=0) if label_components else np.zeros((1,))
-        label_prob = 1.0 / (1.0 + math.exp(-float(np.mean(label_vector))))
-        label = int(label_prob * config.num_classes)
-        label = min(label, config.num_classes - 1)
-        dataset.append((label_prob, modality_data))
-
-    dataset.sort(key=lambda item: item[0])
-    items_per_class = config.num_data // config.num_classes
-    for label in range(config.num_classes):
-        class_slice = dataset[label * items_per_class : (label + 1) * items_per_class]
-        for modality_index in range(config.modality_number):
-            for _, modality_values in class_slice:
-                total_data[modality_index].append(modality_values[modality_index])
-        total_labels.append([label] * len(class_slice))
-
-    total_labels_array = np.array(total_labels, dtype=np.int64).reshape(-1, 1)
-    for modality_index in range(config.modality_number):
-        total_data[modality_index] = np.vstack(total_data[modality_index]).astype(np.float32)
-
-    stacked_modalities = np.array(total_data).transpose((1, 0, 2))
-    holdout_size = 1.0 - config.train_size
-    valid_fraction_of_holdout = config.valid_size / max(holdout_size, 1e-8)
-    valid_fraction_of_holdout = min(max(valid_fraction_of_holdout, 0.0), 1.0)
-
-    x_train, x_tmp, y_train, y_tmp = train_test_split(
-        stacked_modalities,
-        total_labels_array,
-        test_size=holdout_size,
-        stratify=total_labels_array,
-        random_state=config.seed,
+    train_modalities, train_labels = _generate_official_gaussian_split(
+        num_samples=train_count,
+        num_classes=config.num_classes,
+        rho=config.rho,
+        noise_degree=config.noise_degree,
+        rng=rng_train,
     )
-    x_valid, x_test, y_valid, y_test = train_test_split(
-        x_tmp,
-        y_tmp,
-        test_size=max(1.0 - valid_fraction_of_holdout, 1e-8),
-        stratify=y_tmp,
-        random_state=config.seed + 1,
+    valid_modalities, valid_labels = _generate_official_gaussian_split(
+        num_samples=valid_count,
+        num_classes=config.num_classes,
+        rho=config.rho,
+        noise_degree=config.noise_degree,
+        rng=rng_valid,
+    )
+    test_modalities, test_labels = _generate_official_gaussian_split(
+        num_samples=test_count,
+        num_classes=config.num_classes,
+        rho=config.rho,
+        noise_degree=config.noise_degree,
+        rng=rng_test,
     )
 
-    data = {"train": {}, "valid": {}, "test": {}}
-    for modality_index in range(config.modality_number):
-        data["train"][str(modality_index)] = np.array(x_train)[:, modality_index, :]
-        data["valid"][str(modality_index)] = np.array(x_valid)[:, modality_index, :]
-        data["test"][str(modality_index)] = np.array(x_test)[:, modality_index, :]
-    data["train"]["label"] = np.array(y_train)
-    data["valid"]["label"] = np.array(y_valid)
-    data["test"]["label"] = np.array(y_test)
-    return data
+    return {
+        "train": {
+            "0": train_modalities[0],
+            "1": train_modalities[1],
+            "label": train_labels.reshape(-1, 1),
+        },
+        "valid": {
+            "0": valid_modalities[0],
+            "1": valid_modalities[1],
+            "label": valid_labels.reshape(-1, 1),
+        },
+        "test": {
+            "0": test_modalities[0],
+            "1": test_modalities[1],
+            "label": test_labels.reshape(-1, 1),
+        },
+    }
+
+
+def _generate_official_gaussian_split(
+    *,
+    num_samples: int,
+    num_classes: int,
+    rho: float,
+    noise_degree: float,
+    rng: np.random.Generator,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    labels = rng.integers(0, num_classes, size=num_samples, endpoint=False, dtype=np.int64)
+    rows = np.arange(num_samples)
+    onehot = np.zeros((num_samples, num_classes), dtype=np.float64)
+    onehot[rows, labels] = 1.0
+
+    u = rng.standard_normal((num_samples, num_classes), dtype=np.float64) * noise_degree
+    v = rng.standard_normal((num_samples, num_classes), dtype=np.float64) * noise_degree
+    x1 = onehot + u
+    x2 = onehot + rho * u + np.sqrt(max(1.0 - rho**2, 0.0)) * v
+    return [x1.astype(np.float32), x2.astype(np.float32)], labels.astype(np.int64)
 
 
 def save_generated_dataset(
