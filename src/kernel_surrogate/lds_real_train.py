@@ -482,10 +482,13 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
     dim_y = int(data["train_y"].shape[1])
     num_classes = int(data["num_classes"])
     task = str(data["task"])
+    eval_x = data["test_x"] if "test_x" in data else data["val_x"]
+    eval_y = data["test_y"] if "test_y" in data else data["val_y"]
+    eval_labels = data["test_labels"] if "test_labels" in data else data["val_labels"]
     test_loader = make_loader(
-        data["test_x"],
-        data["test_y"],
-        data["test_labels"],
+        eval_x,
+        eval_y,
+        eval_labels,
         args.eval_batch_size,
         False,
     )
