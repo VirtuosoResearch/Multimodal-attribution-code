@@ -198,6 +198,8 @@ def _evaluate_classifier(
     task: str,
     device: str,
     max_sample_losses: int,
+    use_x: bool,
+    use_y: bool,
 ) -> dict[str, float | str | list[float] | int]:
     model.eval()
     total_loss = 0.0
@@ -211,7 +213,7 @@ def _evaluate_classifier(
             by = by.to(device)
             bl = bl.to(device)
 
-            logits = model(bx, by, use_x=True, use_y=True)
+            logits = model(bx, by, use_x=use_x, use_y=use_y)
             loss = compute_loss(task, logits, bl)
             per_sample_loss = _per_sample_loss(task, logits, bl)
             batch_size = int(bl.shape[0])
@@ -326,6 +328,8 @@ def _base_logits(
     *,
     device: str,
     batch_size: int,
+    use_x: bool,
+    use_y: bool,
 ) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
     model.eval()
@@ -334,7 +338,7 @@ def _base_logits(
         bx = x[start:end].to(device)
         by = y[start:end].to(device)
         with torch.inference_mode():
-            chunks.append(model(bx, by, use_x=True, use_y=True).detach().cpu())
+            chunks.append(model(bx, by, use_x=use_x, use_y=use_y).detach().cpu())
     return torch.cat(chunks, dim=0).float()
 
 
@@ -349,6 +353,8 @@ def _projected_logits(
     projection_seed: int,
     projection_mode: str,
     finite_diff_epsilon: float,
+    use_x: bool,
+    use_y: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[0] == 0:
         raise ValueError("cannot project gradients for an empty tensor batch")
@@ -359,7 +365,15 @@ def _projected_logits(
     scale = float(proj_dim) ** -0.5
 
     projected_by_direction: list[torch.Tensor] = []
-    base_logits = _base_logits(model, x, y, device=device, batch_size=batch_size)
+    base_logits = _base_logits(
+        model,
+        x,
+        y,
+        device=device,
+        batch_size=batch_size,
+        use_x=use_x,
+        use_y=use_y,
+    )
 
     for direction_index in range(proj_dim):
         tangent = _random_tangent_like(
@@ -385,7 +399,7 @@ def _projected_logits(
                     model,
                     (param_values, buffers),
                     (bx, by),
-                    {"use_x": True, "use_y": True},
+                    {"use_x": use_x, "use_y": use_y},
                 )
 
             if projection_mode == "jvp":
@@ -493,6 +507,8 @@ def _linearized_logits_from_parameter_delta(
     device: str,
     batch_size: int,
     finite_diff_epsilon: float,
+    use_x: bool,
+    use_y: bool,
 ) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
     eps = float(finite_diff_epsilon)
@@ -505,7 +521,7 @@ def _linearized_logits_from_parameter_delta(
             model,
             (perturbed_params, buffers),
             (bx, by),
-            {"use_x": True, "use_y": True},
+            {"use_x": use_x, "use_y": use_y},
         )
         chunks.append(base_logits[start:end].to(device) + (perturbed_logits - base_logits[start:end].to(device)) / eps)
     return torch.cat(chunks, dim=0)
@@ -525,6 +541,8 @@ def _fit_parameter_delta(
     device: str,
     batch_size: int,
     finite_diff_epsilon: float,
+    use_x: bool,
+    use_y: bool,
 ) -> tuple[dict[str, torch.Tensor], list[float]]:
     model.eval()
     params = {name: value.detach().to(device) for name, value in model.named_parameters()}
@@ -555,6 +573,8 @@ def _fit_parameter_delta(
             device=device,
             batch_size=batch_size,
             finite_diff_epsilon=finite_diff_epsilon,
+            use_x=use_x,
+            use_y=use_y,
         )
         data_loss = _linearized_loss(task=task, logits=logits, labels=labels)
         loss = data_loss + 0.5 * float(ridge_lambda) * _parameter_delta_norm(delta)
@@ -577,6 +597,8 @@ def _predict_with_parameter_delta(
     device: str,
     batch_size: int,
     finite_diff_epsilon: float,
+    use_x: bool,
+    use_y: bool,
 ) -> torch.Tensor:
     params = {name: value.detach().to(device) for name, value in model.named_parameters()}
     buffers = {name: value.detach().to(device) for name, value in model.named_buffers()}
@@ -593,6 +615,8 @@ def _predict_with_parameter_delta(
             device=device,
             batch_size=batch_size,
             finite_diff_epsilon=finite_diff_epsilon,
+            use_x=use_x,
+            use_y=use_y,
         ).detach().cpu()
 
 
@@ -607,6 +631,8 @@ def _run_gradient_estimation_subset(
     test_projected_logits: torch.Tensor | None,
     args: argparse.Namespace,
     projection_seed: int,
+    use_x: bool,
+    use_y: bool,
 ) -> dict[str, Any]:
     train_x, train_y, train_labels = _masked_subset_tensors(data, subset_indices, sample_modality_mask)
     if args.gradient_space == "parameter":
@@ -616,6 +642,8 @@ def _run_gradient_estimation_subset(
             train_y,
             device=args.device,
             batch_size=args.gradient_batch_size,
+            use_x=use_x,
+            use_y=use_y,
         )
         delta, fit_losses = _fit_parameter_delta(
             model=model,
@@ -630,6 +658,8 @@ def _run_gradient_estimation_subset(
             device=args.device,
             batch_size=args.gradient_batch_size,
             finite_diff_epsilon=args.gradient_finite_diff_epsilon,
+            use_x=use_x,
+            use_y=use_y,
         )
         test_logits = _predict_with_parameter_delta(
             model=model,
@@ -640,6 +670,8 @@ def _run_gradient_estimation_subset(
             device=args.device,
             batch_size=args.gradient_batch_size,
             finite_diff_epsilon=args.gradient_finite_diff_epsilon,
+            use_x=use_x,
+            use_y=use_y,
         )
     else:
         if test_projected_logits is None:
@@ -654,6 +686,8 @@ def _run_gradient_estimation_subset(
             projection_seed=projection_seed,
             projection_mode=args.gradient_projection_mode,
             finite_diff_epsilon=args.gradient_finite_diff_epsilon,
+            use_x=use_x,
+            use_y=use_y,
         )
         z, fit_losses = _fit_projected_delta(
             task=task,
@@ -691,6 +725,8 @@ def _train_model(
     model_type: str,
     args: argparse.Namespace,
     seed: int,
+    use_x: bool,
+    use_y: bool,
 ) -> tuple[torch.nn.Module, list[float]]:
     set_seed(seed)
     model = build_model(model_type, dim_x, dim_y, num_classes, args).to(args.device)
@@ -707,7 +743,7 @@ def _train_model(
             bl = bl.to(args.device)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(bx, by, use_x=True, use_y=True)
+            logits = model(bx, by, use_x=use_x, use_y=use_y)
             loss = compute_loss(task, logits, bl)
             loss.backward()
             optimizer.step()
@@ -1020,6 +1056,8 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"requested device {args.device} but CUDA is unavailable")
+    if not args.use_x and not args.use_y:
+        raise ValueError("at least one modality must be enabled: set --use-x and/or --use-y")
 
 
 def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[str, Any]:
@@ -1045,7 +1083,11 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
         traffic_test_years=args.traffic_test_years,
         traffic_months=args.traffic_months,
         traffic_include_dynamic_node_features=args.traffic_include_dynamic_node_features,
+        traffic_include_static_edge_features=args.traffic_include_static_edge_features,
+        traffic_include_dynamic_edge_features=args.traffic_include_dynamic_edge_features,
+        traffic_negative_ratio=args.traffic_negative_ratio,
         traffic_label_threshold=args.traffic_label_threshold,
+        traffic_normalize_modalities=args.traffic_normalize_modalities,
     )
 
     base_train_loader = make_loader(
@@ -1126,6 +1168,10 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
     dim_y = int(data["train_y"].shape[1])
     num_classes = int(data["num_classes"])
     task = str(data["task"])
+    print(
+        f"[{dataset_name}] seed={seed}: modality forward flags use_x={args.use_x}, use_y={args.use_y}",
+        flush=True,
+    )
     eval_x = data["test_x"] if "test_x" in data else data["val_x"]
     eval_y = data["test_y"] if "test_y" in data else data["val_y"]
     eval_labels = data["test_labels"] if "test_labels" in data else data["val_labels"]
@@ -1164,6 +1210,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                 projection_seed=int(args.gradient_projection_seed_base) + int(seed) * 1_000_000,
                 projection_mode=args.gradient_projection_mode,
                 finite_diff_epsilon=args.gradient_finite_diff_epsilon,
+                use_x=args.use_x,
+                use_y=args.use_y,
             )
         else:
             test_base_logits = _base_logits(
@@ -1172,6 +1220,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                 data["test_y"],
                 device=args.device,
                 batch_size=args.gradient_batch_size,
+                use_x=args.use_x,
+                use_y=args.use_y,
             )
 
     for offset, subset_spec in enumerate(subset_specs, start=len(completed_runs)):
@@ -1260,6 +1310,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                 test_projected_logits=test_projected_logits,
                 args=args,
                 projection_seed=projection_seed,
+                use_x=args.use_x,
+                use_y=args.use_y,
             )
             repeat_test_losses.append(float(test_metrics["loss"]))
             repeat_test_accs.append(float(test_metrics["acc"]))
@@ -1304,6 +1356,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                     model_type=args.model,
                     args=args,
                     seed=train_seed,
+                    use_x=args.use_x,
+                    use_y=args.use_y,
                 )
                 test_metrics = _evaluate_classifier(
                     model,
@@ -1311,6 +1365,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                     task=task,
                     device=args.device,
                     max_sample_losses=args.max_test_loss_samples,
+                    use_x=args.use_x,
+                    use_y=args.use_y,
                 )
                 checkpoint_path = _checkpoint_path(
                     args.checkpoint_dir,
@@ -1512,11 +1568,39 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--traffic-include-static-edge-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--traffic-include-dynamic-edge-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--traffic-negative-ratio", type=float, default=1.0)
     parser.add_argument("--traffic-label-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--traffic-normalize-modalities",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--batch-size", type=int, default=4196)
     parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument(
+        "--use-x",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use x modality during train/eval forward pass.",
+    )
+    parser.add_argument(
+        "--use-y",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use y modality during train/eval forward pass.",
+    )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--proj-dim", type=int, default=256)
