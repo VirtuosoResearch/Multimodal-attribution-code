@@ -6,11 +6,13 @@ All outputs are flat float32 tensors of shape [N, D].
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 from torchvision import datasets as tv_datasets
 from torch.utils.data import DataLoader, TensorDataset
@@ -29,6 +31,12 @@ UML_ROOT = Path("/data/zhenshuo/multimodal/Unpaired-Multimodal-Learning"
                 "/vision_language")
 DATASETS_ROOT = Path("/data/zhenshuo/datasets")
 BACKBONE_CACHE_ROOT = DATASETS_ROOT / "backbone_cache"
+TRAFFIC_PROJECT_ROOT = ROOT.parent / "Satellite-images-for-accident-analysis"
+_IMDB_SPLITS = {
+    "train": (0, 15552),
+    "valid": (15552, 18160),
+    "test": (18160, 25959),
+}
 
 
 def _slug(value: str) -> str:
@@ -273,24 +281,50 @@ def _load_affect_features(dataset_name: str) -> dict[str, Any]:
 
 
 def _load_imdb_features() -> dict[str, Any]:
-    from opt_motivation.core import load_imdb
+    import h5py
 
-    ds = load_imdb("/data/zhenshuo/datasets/multimodal_imdb.hdf5",
-                   train_max_samples=None, valid_max_samples=None,
-                   test_max_samples=None)
+    env_path = os.environ.get("MMIMDB_HDF5_PATH")
+    candidates = [
+        Path(env_path) if env_path else None,
+        DATASETS_ROOT / "multimodal_imdb.hdf5",
+        ROOT / "src" / "datasets" / "multimodal_imdb.hdf5",
+        ROOT / "data" / "datasets" / "multimodal_imdb.hdf5",
+    ]
+    imdb_path = next((path for path in candidates if path is not None and path.exists()), None)
+    if imdb_path is None:
+        checked = ", ".join(str(path) for path in candidates if path is not None)
+        raise FileNotFoundError(
+            "MM-IMDb file not found. Checked: "
+            f"{checked}. Set MMIMDB_HDF5_PATH to your multimodal_imdb.hdf5 path."
+        )
 
-    def _split(split):
-        text_raw = torch.from_numpy(split.modalities["text"]).float()
-        text = text_raw.mean(dim=1) if text_raw.ndim == 3 else text_raw
-        image = torch.from_numpy(split.modalities["image"]).float()
-        labels = torch.from_numpy(split.labels).float()
+    def _split(handle: h5py.File, split_name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        start, stop = _IMDB_SPLITS[split_name]
+        text = torch.from_numpy(np.asarray(handle["features"][start:stop], dtype=np.float32))
+        if "vgg_features" in handle:
+            image = torch.from_numpy(np.asarray(handle["vgg_features"][start:stop], dtype=np.float32))
+        elif "images" in handle:
+            image_raw = np.asarray(handle["images"][start:stop], dtype=np.float32)
+            image = torch.from_numpy(image_raw.reshape(image_raw.shape[0], -1))
+        else:
+            raise KeyError("MM-IMDb hdf5 missing both 'vgg_features' and 'images' datasets")
+        labels = torch.from_numpy(np.asarray(handle["genres"][start:stop], dtype=np.float32))
         return text, image, labels
 
-    tr_x, tr_y, tr_l = _split(ds.train)
-    va_x, va_y, va_l = _split(ds.valid)
+    try:
+        with h5py.File(imdb_path, "r") as handle:
+            tr_x, tr_y, tr_l = _split(handle, "train")
+            va_x, va_y, va_l = _split(handle, "valid")
+            te_x, te_y, te_l = _split(handle, "test")
+    except OSError as exc:
+        raise OSError(
+            f"Failed to open MM-IMDb file at {imdb_path}. "
+            "The file may be incomplete/corrupted (for example, interrupted download)."
+        ) from exc
     return {
         "train_x": tr_x, "train_y": tr_y, "train_labels": tr_l,
         "val_x": va_x, "val_y": va_y, "val_labels": va_l,
+        "test_x": te_x, "test_y": te_y, "test_labels": te_l,
         "num_classes": int(tr_l.shape[1]), "task": "multilabel",
         "name": "imdb",
     }
@@ -363,6 +397,234 @@ def _load_affect_mosi_mosei(dataset_name: str) -> dict[str, Any]:
     }
 
 
+def _accident_node_labels_for_month(
+    accidents_df: pd.DataFrame,
+    *,
+    year: int,
+    month: int,
+    num_nodes: int,
+    threshold: float,
+) -> torch.Tensor:
+    labels = torch.zeros(num_nodes, dtype=torch.float32)
+    month_df = accidents_df[
+        (accidents_df["year"] == int(year))
+        & (accidents_df["month"] == int(month))
+    ]
+    if month_df.empty:
+        return labels.long()
+
+    node_1 = month_df["node_1_idx"].to_numpy(dtype=np.int64)
+    node_2 = month_df["node_2_idx"].to_numpy(dtype=np.int64)
+    counts = month_df["acc_count"].to_numpy(dtype=np.float32)
+    valid_1 = (node_1 >= 0) & (node_1 < num_nodes)
+    valid_2 = (node_2 >= 0) & (node_2 < num_nodes)
+    if np.any(valid_1):
+        labels.index_add_(
+            0,
+            torch.from_numpy(node_1[valid_1]),
+            torch.from_numpy(counts[valid_1]),
+        )
+    if np.any(valid_2):
+        labels.index_add_(
+            0,
+            torch.from_numpy(node_2[valid_2]),
+            torch.from_numpy(counts[valid_2]),
+        )
+    return (labels > float(threshold)).long()
+
+
+def _monthly_node_features(
+    data_dir: Path,
+    *,
+    state_name: str,
+    year: int,
+    month: int,
+) -> torch.Tensor:
+    node_feature_file = data_dir / state_name / "Nodes" / f"node_features_{year}_{month}.csv"
+    if not node_feature_file.exists():
+        raise FileNotFoundError(f"Missing traffic node feature file: {node_feature_file}")
+    node_df = pd.read_csv(node_feature_file)
+    weather_columns = ["tavg", "tmin", "tmax", "prcp", "wspd", "pres"]
+    missing_columns = [column for column in weather_columns if column not in node_df.columns]
+    if missing_columns:
+        raise KeyError(
+            f"Missing weather columns {missing_columns} in {node_feature_file}"
+        )
+    node_df = node_df[weather_columns].fillna(node_df[weather_columns].mean()).fillna(0.0)
+    return torch.from_numpy(node_df.to_numpy(dtype=np.float32))
+
+
+def _build_traffic_split(
+    *,
+    years: list[int],
+    months: list[int],
+    state_name: str,
+    data_dir: Path,
+    tabular_static: torch.Tensor,
+    vision_features: torch.Tensor,
+    accidents_df: pd.DataFrame,
+    include_dynamic_node_features: bool,
+    label_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    split_tabular: list[torch.Tensor] = []
+    split_vision: list[torch.Tensor] = []
+    split_labels: list[torch.Tensor] = []
+    num_nodes = int(tabular_static.shape[0])
+
+    for year in years:
+        for month in months:
+            dynamic_features = _monthly_node_features(
+                data_dir,
+                state_name=state_name,
+                year=int(year),
+                month=int(month),
+            )
+            if dynamic_features.shape[0] != num_nodes:
+                raise ValueError(
+                    "Traffic node count mismatch between static and dynamic features: "
+                    f"{num_nodes} vs {dynamic_features.shape[0]} in {year}-{month:02d}"
+                )
+            if include_dynamic_node_features:
+                tabular = torch.cat([tabular_static, dynamic_features], dim=1)
+            else:
+                tabular = tabular_static
+            labels = _accident_node_labels_for_month(
+                accidents_df,
+                year=int(year),
+                month=int(month),
+                num_nodes=num_nodes,
+                threshold=label_threshold,
+            )
+            split_tabular.append(tabular)
+            split_vision.append(vision_features)
+            split_labels.append(labels)
+
+    if not split_tabular:
+        raise ValueError(
+            f"No traffic split samples were constructed for years={years} and months={months}"
+        )
+    return (
+        torch.cat(split_tabular, dim=0).float(),
+        torch.cat(split_vision, dim=0).float(),
+        torch.cat(split_labels, dim=0).long(),
+    )
+
+
+def _resolve_state_embedding_file(
+    embedding_root: Path,
+    *,
+    feature_type: str,
+    state_name: str,
+) -> Path:
+    feature_dir = embedding_root / feature_type
+    exact = feature_dir / f"{state_name}.npy"
+    if exact.exists():
+        return exact
+
+    candidates = sorted(feature_dir.glob(f"{state_name}_*.npy"))
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise FileNotFoundError(
+            f"Multiple candidate files found for state={state_name}, feature_type={feature_type}: "
+            f"{[str(path) for path in candidates]}. Please pass a more specific feature type or rename files."
+        )
+    raise FileNotFoundError(
+        f"Missing traffic embedding file for state={state_name}, feature_type={feature_type}. "
+        f"Checked exact path {exact} and wildcard pattern {feature_dir / (state_name + '_*.npy')}."
+    )
+
+
+def _load_traffic_accident_features(
+    *,
+    state_name: str,
+    data_dir: str | None,
+    embeddings_dir: str | None,
+    node_feature_type: str,
+    vision_feature_type: str,
+    train_years: list[int],
+    valid_years: list[int],
+    test_years: list[int],
+    months: list[int],
+    include_dynamic_node_features: bool,
+    label_threshold: float,
+) -> dict[str, Any]:
+    data_root = Path(data_dir) if data_dir is not None else TRAFFIC_PROJECT_ROOT / "data"
+    embedding_root = Path(embeddings_dir) if embeddings_dir is not None else TRAFFIC_PROJECT_ROOT / "embeddings"
+
+    accidents_file = data_root / state_name / "accidents_monthly.csv"
+    if not accidents_file.exists():
+        raise FileNotFoundError(f"Missing traffic accidents file: {accidents_file}")
+    accidents_df = pd.read_csv(accidents_file)
+
+    tabular_static_file = _resolve_state_embedding_file(
+        embedding_root,
+        feature_type=node_feature_type,
+        state_name=state_name,
+    )
+    vision_feature_file = _resolve_state_embedding_file(
+        embedding_root,
+        feature_type=vision_feature_type,
+        state_name=state_name,
+    )
+
+    tabular_static = torch.from_numpy(np.load(tabular_static_file).astype(np.float32))
+    vision_features = torch.from_numpy(np.load(vision_feature_file).astype(np.float32))
+    if tabular_static.shape[0] != vision_features.shape[0]:
+        raise ValueError(
+            "Traffic node count mismatch between tabular and vision features: "
+            f"{tabular_static.shape[0]} vs {vision_features.shape[0]}"
+        )
+
+    train_x, train_y, train_labels = _build_traffic_split(
+        years=[int(year) for year in train_years],
+        months=[int(month) for month in months],
+        state_name=state_name,
+        data_dir=data_root,
+        tabular_static=tabular_static,
+        vision_features=vision_features,
+        accidents_df=accidents_df,
+        include_dynamic_node_features=include_dynamic_node_features,
+        label_threshold=label_threshold,
+    )
+    val_x, val_y, val_labels = _build_traffic_split(
+        years=[int(year) for year in valid_years],
+        months=[int(month) for month in months],
+        state_name=state_name,
+        data_dir=data_root,
+        tabular_static=tabular_static,
+        vision_features=vision_features,
+        accidents_df=accidents_df,
+        include_dynamic_node_features=include_dynamic_node_features,
+        label_threshold=label_threshold,
+    )
+    test_x, test_y, test_labels = _build_traffic_split(
+        years=[int(year) for year in test_years],
+        months=[int(month) for month in months],
+        state_name=state_name,
+        data_dir=data_root,
+        tabular_static=tabular_static,
+        vision_features=vision_features,
+        accidents_df=accidents_df,
+        include_dynamic_node_features=include_dynamic_node_features,
+        label_threshold=label_threshold,
+    )
+    return {
+        "train_x": train_x,
+        "train_y": train_y,
+        "train_labels": train_labels,
+        "val_x": val_x,
+        "val_y": val_y,
+        "val_labels": val_labels,
+        "test_x": test_x,
+        "test_y": test_y,
+        "test_labels": test_labels,
+        "num_classes": 1,
+        "task": "binary",
+        "name": f"traffic_accident_{state_name.lower()}",
+    }
+
+
 def load_dataset(
     name: str,
     seed: int,
@@ -373,6 +635,17 @@ def load_dataset(
     backbone_batch_size: int = 32,
     download_datasets: bool = False,
     backbone_cache_dir: str | None = None,
+    traffic_state_name: str = "DE",
+    traffic_data_dir: str | None = None,
+    traffic_embeddings_dir: str | None = None,
+    traffic_node_feature_type: str = "node2vec",
+    traffic_vision_feature_type: str = "clip_image",
+    traffic_train_years: list[int] | None = None,
+    traffic_valid_years: list[int] | None = None,
+    traffic_test_years: list[int] | None = None,
+    traffic_months: list[int] | None = None,
+    traffic_include_dynamic_node_features: bool = True,
+    traffic_label_threshold: float = 0.0,
 ) -> dict[str, Any]:
     """Load a dataset by name. Returns dict with train/val tensors."""
     if name == "food101":
@@ -398,13 +671,40 @@ def load_dataset(
             cache_dir=backbone_cache_dir,
         )
 
-    if text_backbone != "clip_cached" or vision_backbone != "clip_cached":
+    is_traffic_dataset = (
+        name in {"traffic_accident", "traffic_accident_prediction"}
+        or name.startswith("traffic_accident_")
+    )
+    if (
+        (text_backbone != "clip_cached" or vision_backbone != "clip_cached")
+        and name not in {"avmnist"}
+        and not is_traffic_dataset
+    ):
         raise ValueError(
             f"Custom backbone extraction is only wired for food101 / oxford_pets, got dataset={name}"
         )
 
     if name == "avmnist":
         return _load_avmnist_features()
+    if is_traffic_dataset:
+        state_name = traffic_state_name
+        if name.startswith("traffic_accident_"):
+            suffix = name.replace("traffic_accident_", "", 1)
+            if suffix:
+                state_name = suffix.upper()
+        return _load_traffic_accident_features(
+            state_name=state_name,
+            data_dir=traffic_data_dir,
+            embeddings_dir=traffic_embeddings_dir,
+            node_feature_type=traffic_node_feature_type,
+            vision_feature_type=traffic_vision_feature_type,
+            train_years=traffic_train_years if traffic_train_years is not None else [2009, 2010, 2011, 2012, 2013],
+            valid_years=traffic_valid_years if traffic_valid_years is not None else [2014, 2015, 2016, 2017, 2018],
+            test_years=traffic_test_years if traffic_test_years is not None else [2019, 2020, 2021, 2022],
+            months=traffic_months if traffic_months is not None else list(range(1, 13)),
+            include_dynamic_node_features=traffic_include_dynamic_node_features,
+            label_threshold=traffic_label_threshold,
+        )
 
     loaders = {
         "humor": lambda s: _load_affect_features("humor"),
