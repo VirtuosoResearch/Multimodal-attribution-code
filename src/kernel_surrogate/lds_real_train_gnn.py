@@ -43,6 +43,23 @@ SUPPORTED_REAL_DATASETS = (
     "traffic_accident",
 )
 
+TRAFFIC_STATE_DEFAULT_SPLITS: dict[str, dict[str, Any]] = {
+    "de": {
+        "state_name": "DE",
+        "train_years": [2009, 2010, 2011, 2012, 2013],
+        "valid_years": [2014, 2015, 2016, 2017, 2018],
+        "test_years": [2019, 2020, 2021, 2022],
+        "months": list(range(1, 13)),
+    },
+    "ma": {
+        "state_name": "MA",
+        "train_years": [2009, 2010, 2011, 2012, 2013, 2014],
+        "valid_years": [2015, 2016, 2017, 2018, 2019, 2020],
+        "test_years": [2021, 2022],
+        "months": list(range(1, 13)),
+    },
+}
+
 
 def _result_path(result_dir: Path, *, dataset_name: str, seed: int) -> Path:
     return result_dir / f"{dataset_name}_seed{seed}.json"
@@ -723,13 +740,21 @@ def _train_model(
     num_classes: int,
     task: str,
     model_type: str,
+    model_kwargs: dict[str, Any],
     args: argparse.Namespace,
     seed: int,
     use_x: bool,
     use_y: bool,
 ) -> tuple[torch.nn.Module, list[float]]:
     set_seed(seed)
-    model = build_model(model_type, dim_x, dim_y, num_classes, args).to(args.device)
+    model = build_model(
+        model_type,
+        dim_x,
+        dim_y,
+        num_classes,
+        args,
+        model_kwargs=model_kwargs,
+    ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     epoch_losses: list[float] = []
 
@@ -1058,6 +1083,72 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise RuntimeError(f"requested device {args.device} but CUDA is unavailable")
     if not args.use_x and not args.use_y:
         raise ValueError("at least one modality must be enabled: set --use-x and/or --use-y")
+    if args.traffic_gnn_layers <= 0:
+        raise ValueError(f"traffic_gnn_layers must be positive, got {args.traffic_gnn_layers}")
+    if args.traffic_classifier_layers <= 0:
+        raise ValueError(
+            f"traffic_classifier_layers must be positive, got {args.traffic_classifier_layers}"
+        )
+    if not args.traffic_state_name:
+        raise ValueError("traffic_state_name must be non-empty")
+    if not args.traffic_train_years:
+        raise ValueError("traffic_train_years must be non-empty")
+    if not args.traffic_valid_years:
+        raise ValueError("traffic_valid_years must be non-empty")
+    if not args.traffic_test_years:
+        raise ValueError("traffic_test_years must be non-empty")
+    if not args.traffic_months:
+        raise ValueError("traffic_months must be non-empty")
+    if any(month < 1 or month > 12 for month in args.traffic_months):
+        raise ValueError(f"traffic_months must be in [1, 12], got {args.traffic_months}")
+
+
+def _apply_traffic_state_defaults(args: argparse.Namespace) -> None:
+    state_key = str(args.traffic_state_name).strip().lower()
+    if not state_key:
+        raise ValueError("traffic_state_name must be non-empty")
+    preset = TRAFFIC_STATE_DEFAULT_SPLITS.get(state_key)
+    if preset is None:
+        # Keep custom states usable without touching code.
+        preset = {
+            "train_years": [2009, 2010, 2011, 2012, 2013],
+            "valid_years": [2014, 2015, 2016, 2017, 2018],
+            "test_years": [2019, 2020, 2021, 2022],
+            "months": list(range(1, 13)),
+        }
+    args.traffic_state_name = str(args.traffic_state_name).strip().upper()
+    if args.traffic_train_years is None:
+        args.traffic_train_years = [int(year) for year in preset["train_years"]]
+    if args.traffic_valid_years is None:
+        args.traffic_valid_years = [int(year) for year in preset["valid_years"]]
+    if args.traffic_test_years is None:
+        args.traffic_test_years = [int(year) for year in preset["test_years"]]
+    if args.traffic_months is None:
+        args.traffic_months = [int(month) for month in preset["months"]]
+
+
+def _resolve_model_kwargs(
+    *,
+    model_type: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    if model_type != "traffic_pair_gnn_mlp":
+        return {}
+    required_keys = (
+        "traffic_node_tabular_dim",
+        "traffic_edge_tabular_dim",
+        "traffic_vision_node_dim",
+    )
+    if any(key not in data for key in required_keys):
+        raise ValueError(
+            "traffic_pair_gnn_mlp requires traffic dataset metadata keys "
+            "traffic_node_tabular_dim, traffic_edge_tabular_dim, and traffic_vision_node_dim"
+        )
+    return {
+        "x_node_dim": int(data["traffic_node_tabular_dim"]),
+        "x_edge_dim": int(data["traffic_edge_tabular_dim"]),
+        "y_node_dim": int(data["traffic_vision_node_dim"]),
+    }
 
 
 def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[str, Any]:
@@ -1168,6 +1259,14 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
     dim_y = int(data["train_y"].shape[1])
     num_classes = int(data["num_classes"])
     task = str(data["task"])
+    model_kwargs = _resolve_model_kwargs(model_type=args.model, data=data)
+    if args.model == "traffic_pair_gnn_mlp":
+        print(
+            f"[{dataset_name}] seed={seed}: traffic_pair_gnn_mlp dims "
+            f"x=[edge({model_kwargs['x_edge_dim']}) + u_node({model_kwargs['x_node_dim']}) + v_node({model_kwargs['x_node_dim']})], "
+            f"y=[u_image({model_kwargs['y_node_dim']}) + v_image({model_kwargs['y_node_dim']})]",
+            flush=True,
+        )
     print(
         f"[{dataset_name}] seed={seed}: modality forward flags use_x={args.use_x}, use_y={args.use_y}",
         flush=True,
@@ -1198,7 +1297,14 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
             flush=True,
         )
         set_seed(init_seed)
-        gradient_model = build_model(args.model, dim_x, dim_y, num_classes, args).to(args.device)
+        gradient_model = build_model(
+            args.model,
+            dim_x,
+            dim_y,
+            num_classes,
+            args,
+            model_kwargs=model_kwargs,
+        ).to(args.device)
         if args.gradient_space == "random_projection":
             test_base_logits, test_projected_logits = _projected_logits(
                 gradient_model,
@@ -1354,6 +1460,7 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                     num_classes=num_classes,
                     task=task,
                     model_type=args.model,
+                    model_kwargs=model_kwargs,
                     args=args,
                     seed=train_seed,
                     use_x=args.use_x,
@@ -1544,7 +1651,11 @@ def main() -> None:
             "and saving subset metadata, checkpoints, and test metrics."
         )
     )
-    parser.add_argument("--model", choices=["concat_mlp", "shared_mlp", "cross_attention"], default="cross_attention")
+    parser.add_argument(
+        "--model",
+        choices=["concat_mlp", "shared_mlp", "cross_attention", "traffic_pair_gnn_mlp"],
+        default="cross_attention",
+    )
     parser.add_argument("--datasets", nargs="+", default=list(SUPPORTED_REAL_DATASETS))
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--device", default="cuda:0")
@@ -1559,10 +1670,10 @@ def main() -> None:
     parser.add_argument("--traffic-embeddings-dir", default=None)
     parser.add_argument("--traffic-node-feature-type", default="node2vec")
     parser.add_argument("--traffic-vision-feature-type", default="clip_image")
-    parser.add_argument("--traffic-train-years", nargs="+", type=int, default=[2009, 2010, 2011, 2012, 2013])
-    parser.add_argument("--traffic-valid-years", nargs="+", type=int, default=[2014, 2015, 2016, 2017, 2018])
-    parser.add_argument("--traffic-test-years", nargs="+", type=int, default=[2019, 2020, 2021, 2022])
-    parser.add_argument("--traffic-months", nargs="+", type=int, default=list(range(1, 13)))
+    parser.add_argument("--traffic-train-years", nargs="+", type=int, default=None)
+    parser.add_argument("--traffic-valid-years", nargs="+", type=int, default=None)
+    parser.add_argument("--traffic-test-years", nargs="+", type=int, default=None)
+    parser.add_argument("--traffic-months", nargs="+", type=int, default=None)
     parser.add_argument(
         "--traffic-include-dynamic-node-features",
         action=argparse.BooleanOptionalAction,
@@ -1606,6 +1717,18 @@ def main() -> None:
     parser.add_argument("--proj-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument(
+        "--traffic-gnn-layers",
+        type=int,
+        default=2,
+        help="Message-passing layers used by traffic_pair_gnn_mlp.",
+    )
+    parser.add_argument(
+        "--traffic-classifier-layers",
+        type=int,
+        default=2,
+        help="Classifier MLP layers used by traffic_pair_gnn_mlp.",
+    )
     parser.add_argument("--num-groups", type=int, default=50)
     parser.add_argument("--data-keep-rate", type=float, default=0.25)
     parser.add_argument("--modality-keep-rate", type=float, default=0.9)
@@ -1649,6 +1772,7 @@ def main() -> None:
         args.modality_keep_rate = 1.0 - float(args.modality_missing_rate)
     if args.eval_batch_size is None:
         args.eval_batch_size = args.batch_size
+    _apply_traffic_state_defaults(args)
     _validate_args(args)
     _resolve_output_dirs(args)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)

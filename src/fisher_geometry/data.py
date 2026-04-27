@@ -397,40 +397,103 @@ def _load_affect_mosi_mosei(dataset_name: str) -> dict[str, Any]:
     }
 
 
-def _accident_node_labels_for_month(
-    accidents_df: pd.DataFrame,
-    *,
-    year: int,
-    month: int,
-    num_nodes: int,
-    threshold: float,
-) -> torch.Tensor:
-    labels = torch.zeros(num_nodes, dtype=torch.float32)
-    month_df = accidents_df[
-        (accidents_df["year"] == int(year))
-        & (accidents_df["month"] == int(month))
-    ]
-    if month_df.empty:
-        return labels.long()
+_TRAFFIC_STATIC_EDGE_KEYS = [
+    "oneway",
+    "access_ramp",
+    "bus_stop",
+    "crossing",
+    "disused",
+    "elevator",
+    "escape",
+    "living_street",
+    "motorway",
+    "motorway_link",
+    "primary",
+    "primary_link",
+    "residential",
+    "rest_area",
+    "road",
+    "secondary",
+    "secondary_link",
+    "stairs",
+    "tertiary",
+    "tertiary_link",
+    "trunk",
+    "trunk_link",
+    "unclassified",
+    "unsurfaced",
+]
 
-    node_1 = month_df["node_1_idx"].to_numpy(dtype=np.int64)
-    node_2 = month_df["node_2_idx"].to_numpy(dtype=np.int64)
-    counts = month_df["acc_count"].to_numpy(dtype=np.float32)
-    valid_1 = (node_1 >= 0) & (node_1 < num_nodes)
-    valid_2 = (node_2 >= 0) & (node_2 < num_nodes)
-    if np.any(valid_1):
-        labels.index_add_(
-            0,
-            torch.from_numpy(node_1[valid_1]),
-            torch.from_numpy(counts[valid_1]),
-        )
-    if np.any(valid_2):
-        labels.index_add_(
-            0,
-            torch.from_numpy(node_2[valid_2]),
-            torch.from_numpy(counts[valid_2]),
-        )
-    return (labels > float(threshold)).long()
+
+def _adjust_feature_rows(features: torch.Tensor, target_rows: int) -> torch.Tensor:
+    if int(features.shape[0]) == int(target_rows):
+        return features
+    if int(features.shape[0]) > int(target_rows):
+        return features[:target_rows]
+    pad_rows = int(target_rows) - int(features.shape[0])
+    return torch.cat([features, torch.zeros(pad_rows, int(features.shape[1]), dtype=features.dtype)], dim=0)
+
+
+def _traffic_edge_index(data_dir: Path, *, state_name: str) -> torch.Tensor:
+    adj_path = data_dir / state_name / "adj_matrix.pt"
+    if not adj_path.exists():
+        raise FileNotFoundError(f"Missing traffic adjacency matrix file: {adj_path}")
+    edge_index = torch.load(adj_path, map_location="cpu", weights_only=False).coalesce().indices().long().T
+    return edge_index
+
+
+def _traffic_static_edge_features(
+    data_dir: Path,
+    *,
+    state_name: str,
+    num_edges: int,
+) -> torch.Tensor:
+    feature_path = data_dir / state_name / "Edges" / "edge_features.pt"
+    if not feature_path.exists():
+        return torch.zeros(num_edges, 0, dtype=torch.float32)
+
+    edge_feature_dict = torch.load(feature_path, map_location="cpu", weights_only=False)
+    edge_lengths = edge_feature_dict["length"].coalesce().values().float()
+    length_mean = edge_lengths[~torch.isnan(edge_lengths)].mean()
+    edge_lengths = edge_lengths.clone()
+    edge_lengths[torch.isnan(edge_lengths)] = 0.0 if torch.isnan(length_mean) else length_mean
+    length_std = edge_lengths.std()
+    if float(length_std) == 0.0:
+        length_std = torch.tensor(1.0, dtype=edge_lengths.dtype)
+    normalized_length = ((edge_lengths - edge_lengths.mean()) / length_std).view(-1, 1)
+
+    columns: list[torch.Tensor] = []
+    for key in _TRAFFIC_STATIC_EDGE_KEYS:
+        if key not in edge_feature_dict:
+            values = torch.zeros_like(edge_lengths)
+        else:
+            values = edge_feature_dict[key].coalesce().values().float()
+            values = values.clone()
+            values[torch.isnan(values)] = 0.0
+        columns.append(values.view(-1, 1))
+    columns.append(normalized_length)
+    stacked = torch.cat(columns, dim=1).float()
+    return _adjust_feature_rows(stacked, num_edges)
+
+
+def _traffic_dynamic_edge_features(
+    data_dir: Path,
+    *,
+    state_name: str,
+    year: int,
+    num_edges: int,
+) -> torch.Tensor:
+    yearly_path = data_dir / state_name / "Edges" / f"edge_features_{year}.pt"
+    if not yearly_path.exists():
+        return torch.zeros(num_edges, 1, dtype=torch.float32)
+
+    yearly_dict = torch.load(yearly_path, map_location="cpu", weights_only=False)
+    aadt_values = yearly_dict["AADT"].coalesce().values().float()
+    finite_values = aadt_values[~torch.isnan(aadt_values)]
+    fill_value = 0.0 if finite_values.numel() == 0 else float(finite_values.mean())
+    aadt_values = aadt_values.clone()
+    aadt_values[torch.isnan(aadt_values)] = fill_value
+    return _adjust_feature_rows(aadt_values.view(-1, 1), num_edges)
 
 
 def _monthly_node_features(
@@ -454,7 +517,47 @@ def _monthly_node_features(
     return torch.from_numpy(node_df.to_numpy(dtype=np.float32))
 
 
-def _build_traffic_split(
+def _monthly_accident_edges(
+    accidents_df: pd.DataFrame,
+    *,
+    year: int,
+    month: int,
+    label_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    month_df = accidents_df[
+        (accidents_df["year"] == int(year))
+        & (accidents_df["month"] == int(month))
+    ][["node_1_idx", "node_2_idx", "acc_count"]]
+    if month_df.empty:
+        return (
+            torch.zeros((0, 2), dtype=torch.long),
+            torch.zeros((0,), dtype=torch.long),
+        )
+
+    grouped = month_df.groupby(["node_1_idx", "node_2_idx"], as_index=False).agg({"acc_count": "sum"})
+    edges = torch.from_numpy(grouped[["node_1_idx", "node_2_idx"]].to_numpy(dtype=np.int64))
+    labels = torch.from_numpy((grouped["acc_count"].to_numpy(dtype=np.float32) > float(label_threshold)).astype(np.int64))
+    keep = labels == 1
+    return edges[keep], labels[keep]
+
+
+def _build_edge_samples(
+    *,
+    edge_pairs: torch.Tensor,
+    edge_ids: torch.Tensor,
+    node_tabular: torch.Tensor,
+    edge_tabular: torch.Tensor,
+    node_vision: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    u = edge_pairs[:, 0].long()
+    v = edge_pairs[:, 1].long()
+    x = torch.cat([edge_tabular[edge_ids], node_tabular[u], node_tabular[v]], dim=1).float()
+    y = torch.cat([node_vision[u], node_vision[v]], dim=1).float()
+    return x, y, labels.long()
+
+
+def _build_traffic_edge_split(
     *,
     years: list[int],
     months: list[int],
@@ -462,14 +565,22 @@ def _build_traffic_split(
     data_dir: Path,
     tabular_static: torch.Tensor,
     vision_features: torch.Tensor,
+    edge_index_pairs: torch.Tensor,
+    static_edge_features: torch.Tensor,
     accidents_df: pd.DataFrame,
     include_dynamic_node_features: bool,
+    include_static_edge_features: bool,
+    include_dynamic_edge_features: bool,
+    negative_ratio: float,
     label_threshold: float,
+    seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     split_tabular: list[torch.Tensor] = []
     split_vision: list[torch.Tensor] = []
     split_labels: list[torch.Tensor] = []
     num_nodes = int(tabular_static.shape[0])
+    num_edges = int(edge_index_pairs.shape[0])
+    edge_to_id = {tuple(edge.tolist()): index for index, edge in enumerate(edge_index_pairs)}
 
     for year in years:
         for month in months:
@@ -484,20 +595,86 @@ def _build_traffic_split(
                     "Traffic node count mismatch between static and dynamic features: "
                     f"{num_nodes} vs {dynamic_features.shape[0]} in {year}-{month:02d}"
                 )
-            if include_dynamic_node_features:
-                tabular = torch.cat([tabular_static, dynamic_features], dim=1)
+            node_tabular = torch.cat([tabular_static, dynamic_features], dim=1) if include_dynamic_node_features else tabular_static
+
+            edge_modalities: list[torch.Tensor] = []
+            if include_static_edge_features and int(static_edge_features.shape[1]) > 0:
+                edge_modalities.append(static_edge_features)
+            if include_dynamic_edge_features:
+                edge_modalities.append(
+                    _traffic_dynamic_edge_features(
+                        data_dir,
+                        state_name=state_name,
+                        year=int(year),
+                        num_edges=num_edges,
+                    )
+                )
+            if edge_modalities:
+                edge_tabular = torch.cat(edge_modalities, dim=1).float()
             else:
-                tabular = tabular_static
-            labels = _accident_node_labels_for_month(
+                edge_tabular = torch.zeros(num_edges, 0, dtype=torch.float32)
+
+            positive_edges, positive_labels = _monthly_accident_edges(
                 accidents_df,
                 year=int(year),
                 month=int(month),
-                num_nodes=num_nodes,
-                threshold=label_threshold,
+                label_threshold=label_threshold,
             )
-            split_tabular.append(tabular)
-            split_vision.append(vision_features)
-            split_labels.append(labels)
+            if int(positive_edges.shape[0]) == 0:
+                continue
+
+            valid_mask = torch.as_tensor(
+                [tuple(edge.tolist()) in edge_to_id for edge in positive_edges],
+                dtype=torch.bool,
+            )
+            if int(valid_mask.sum().item()) == 0:
+                continue
+            positive_edges = positive_edges[valid_mask]
+            positive_labels = positive_labels[valid_mask]
+            positive_edge_ids = torch.as_tensor(
+                [edge_to_id[tuple(edge.tolist())] for edge in positive_edges],
+                dtype=torch.long,
+            )
+
+            positive_x, positive_y, positive_l = _build_edge_samples(
+                edge_pairs=positive_edges,
+                edge_ids=positive_edge_ids,
+                node_tabular=node_tabular,
+                edge_tabular=edge_tabular,
+                node_vision=vision_features,
+                labels=positive_labels,
+            )
+            split_tabular.append(positive_x)
+            split_vision.append(positive_y)
+            split_labels.append(positive_l)
+
+            num_pos = int(positive_edges.shape[0])
+            num_neg = int(round(float(negative_ratio) * num_pos))
+            if num_neg <= 0:
+                continue
+            all_edge_ids = np.arange(num_edges, dtype=np.int64)
+            pos_unique = np.unique(positive_edge_ids.numpy())
+            candidate_neg_ids = np.setdiff1d(all_edge_ids, pos_unique, assume_unique=False)
+            if candidate_neg_ids.size == 0:
+                continue
+            num_neg = min(num_neg, int(candidate_neg_ids.size))
+            rng = np.random.default_rng(int(seed) * 1_000_000 + int(year) * 100 + int(month))
+            selected_neg_ids = rng.choice(candidate_neg_ids, size=num_neg, replace=False)
+            negative_edge_ids = torch.from_numpy(selected_neg_ids.astype(np.int64))
+            negative_edges = edge_index_pairs[negative_edge_ids]
+            negative_labels = torch.zeros(num_neg, dtype=torch.long)
+
+            negative_x, negative_y, negative_l = _build_edge_samples(
+                edge_pairs=negative_edges,
+                edge_ids=negative_edge_ids,
+                node_tabular=node_tabular,
+                edge_tabular=edge_tabular,
+                node_vision=vision_features,
+                labels=negative_labels,
+            )
+            split_tabular.append(negative_x)
+            split_vision.append(negative_y)
+            split_labels.append(negative_l)
 
     if not split_tabular:
         raise ValueError(
@@ -525,6 +702,12 @@ def _resolve_state_embedding_file(
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
+        preferred_by_name = feature_dir / f"{state_name}_128.npy"
+        if preferred_by_name in candidates:
+            return preferred_by_name
+        non_lessnode = [path for path in candidates if "lessnode" not in path.stem.lower()]
+        if len(non_lessnode) == 1:
+            return non_lessnode[0]
         raise FileNotFoundError(
             f"Multiple candidate files found for state={state_name}, feature_type={feature_type}: "
             f"{[str(path) for path in candidates]}. Please pass a more specific feature type or rename files."
@@ -547,7 +730,12 @@ def _load_traffic_accident_features(
     test_years: list[int],
     months: list[int],
     include_dynamic_node_features: bool,
+    include_static_edge_features: bool,
+    include_dynamic_edge_features: bool,
+    negative_ratio: float,
     label_threshold: float,
+    normalize_modalities: bool,
+    seed: int,
 ) -> dict[str, Any]:
     data_root = Path(data_dir) if data_dir is not None else TRAFFIC_PROJECT_ROOT / "data"
     embedding_root = Path(embeddings_dir) if embeddings_dir is not None else TRAFFIC_PROJECT_ROOT / "embeddings"
@@ -575,40 +763,89 @@ def _load_traffic_accident_features(
             "Traffic node count mismatch between tabular and vision features: "
             f"{tabular_static.shape[0]} vs {vision_features.shape[0]}"
         )
+    edge_index_pairs = _traffic_edge_index(data_root, state_name=state_name)
+    static_edge_features = _traffic_static_edge_features(
+        data_root,
+        state_name=state_name,
+        num_edges=int(edge_index_pairs.shape[0]),
+    )
 
-    train_x, train_y, train_labels = _build_traffic_split(
+    train_x, train_y, train_labels = _build_traffic_edge_split(
         years=[int(year) for year in train_years],
         months=[int(month) for month in months],
         state_name=state_name,
         data_dir=data_root,
         tabular_static=tabular_static,
         vision_features=vision_features,
+        edge_index_pairs=edge_index_pairs,
+        static_edge_features=static_edge_features,
         accidents_df=accidents_df,
         include_dynamic_node_features=include_dynamic_node_features,
+        include_static_edge_features=include_static_edge_features,
+        include_dynamic_edge_features=include_dynamic_edge_features,
+        negative_ratio=negative_ratio,
         label_threshold=label_threshold,
+        seed=seed,
     )
-    val_x, val_y, val_labels = _build_traffic_split(
+    val_x, val_y, val_labels = _build_traffic_edge_split(
         years=[int(year) for year in valid_years],
         months=[int(month) for month in months],
         state_name=state_name,
         data_dir=data_root,
         tabular_static=tabular_static,
         vision_features=vision_features,
+        edge_index_pairs=edge_index_pairs,
+        static_edge_features=static_edge_features,
         accidents_df=accidents_df,
         include_dynamic_node_features=include_dynamic_node_features,
+        include_static_edge_features=include_static_edge_features,
+        include_dynamic_edge_features=include_dynamic_edge_features,
+        negative_ratio=negative_ratio,
         label_threshold=label_threshold,
+        seed=seed + 1,
     )
-    test_x, test_y, test_labels = _build_traffic_split(
+    test_x, test_y, test_labels = _build_traffic_edge_split(
         years=[int(year) for year in test_years],
         months=[int(month) for month in months],
         state_name=state_name,
         data_dir=data_root,
         tabular_static=tabular_static,
         vision_features=vision_features,
+        edge_index_pairs=edge_index_pairs,
+        static_edge_features=static_edge_features,
         accidents_df=accidents_df,
         include_dynamic_node_features=include_dynamic_node_features,
+        include_static_edge_features=include_static_edge_features,
+        include_dynamic_edge_features=include_dynamic_edge_features,
+        negative_ratio=negative_ratio,
         label_threshold=label_threshold,
+        seed=seed + 2,
     )
+
+    if normalize_modalities:
+        def _normalize_by_train_stats(
+            train_tensor: torch.Tensor,
+            val_tensor: torch.Tensor,
+            test_tensor: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            mean = train_tensor.mean(dim=0, keepdim=True)
+            std = train_tensor.std(dim=0, keepdim=True)
+            std = std.clamp(min=1e-6)
+            return (
+                (train_tensor - mean) / std,
+                (val_tensor - mean) / std,
+                (test_tensor - mean) / std,
+            )
+
+        train_x, val_x, test_x = _normalize_by_train_stats(train_x, val_x, test_x)
+        train_y, val_y, test_y = _normalize_by_train_stats(train_y, val_y, test_y)
+
+    node_tabular_dim = int(tabular_static.shape[1] + (6 if include_dynamic_node_features else 0))
+    edge_tabular_dim = int(
+        (int(static_edge_features.shape[1]) if include_static_edge_features else 0)
+        + (1 if include_dynamic_edge_features else 0)
+    )
+
     return {
         "train_x": train_x,
         "train_y": train_y,
@@ -622,6 +859,9 @@ def _load_traffic_accident_features(
         "num_classes": 1,
         "task": "binary",
         "name": f"traffic_accident_{state_name.lower()}",
+        "traffic_node_tabular_dim": node_tabular_dim,
+        "traffic_edge_tabular_dim": edge_tabular_dim,
+        "traffic_vision_node_dim": int(vision_features.shape[1]),
     }
 
 
@@ -645,7 +885,11 @@ def load_dataset(
     traffic_test_years: list[int] | None = None,
     traffic_months: list[int] | None = None,
     traffic_include_dynamic_node_features: bool = True,
+    traffic_include_static_edge_features: bool = True,
+    traffic_include_dynamic_edge_features: bool = True,
+    traffic_negative_ratio: float = 1.0,
     traffic_label_threshold: float = 0.0,
+    traffic_normalize_modalities: bool = True,
 ) -> dict[str, Any]:
     """Load a dataset by name. Returns dict with train/val tensors."""
     if name == "food101":
@@ -687,23 +931,47 @@ def load_dataset(
     if name == "avmnist":
         return _load_avmnist_features()
     if is_traffic_dataset:
+        traffic_state_defaults: dict[str, dict[str, Any]] = {
+            "de": {
+                "train_years": [2009, 2010, 2011, 2012, 2013],
+                "valid_years": [2014, 2015, 2016, 2017, 2018],
+                "test_years": [2019, 2020, 2021, 2022],
+                "months": list(range(1, 13)),
+            },
+            "ma": {
+                "train_years": [2009, 2010, 2011, 2012, 2013, 2014],
+                "valid_years": [2015, 2016, 2017, 2018, 2019, 2020],
+                "test_years": [2021, 2022],
+                "months": list(range(1, 13)),
+            },
+        }
         state_name = traffic_state_name
         if name.startswith("traffic_accident_"):
             suffix = name.replace("traffic_accident_", "", 1)
             if suffix:
                 state_name = suffix.upper()
+        state_key = str(state_name).strip().lower()
+        default_split = traffic_state_defaults.get(
+            state_key,
+            traffic_state_defaults["de"],
+        )
         return _load_traffic_accident_features(
             state_name=state_name,
             data_dir=traffic_data_dir,
             embeddings_dir=traffic_embeddings_dir,
             node_feature_type=traffic_node_feature_type,
             vision_feature_type=traffic_vision_feature_type,
-            train_years=traffic_train_years if traffic_train_years is not None else [2009, 2010, 2011, 2012, 2013],
-            valid_years=traffic_valid_years if traffic_valid_years is not None else [2014, 2015, 2016, 2017, 2018],
-            test_years=traffic_test_years if traffic_test_years is not None else [2019, 2020, 2021, 2022],
-            months=traffic_months if traffic_months is not None else list(range(1, 13)),
+            train_years=traffic_train_years if traffic_train_years is not None else list(default_split["train_years"]),
+            valid_years=traffic_valid_years if traffic_valid_years is not None else list(default_split["valid_years"]),
+            test_years=traffic_test_years if traffic_test_years is not None else list(default_split["test_years"]),
+            months=traffic_months if traffic_months is not None else list(default_split["months"]),
             include_dynamic_node_features=traffic_include_dynamic_node_features,
+            include_static_edge_features=traffic_include_static_edge_features,
+            include_dynamic_edge_features=traffic_include_dynamic_edge_features,
+            negative_ratio=traffic_negative_ratio,
             label_threshold=traffic_label_threshold,
+            normalize_modalities=traffic_normalize_modalities,
+            seed=int(seed),
         )
 
     loaders = {
