@@ -584,12 +584,18 @@ def _build_traffic_edge_split(
 
     for year in years:
         for month in months:
-            dynamic_features = _monthly_node_features(
-                data_dir,
-                state_name=state_name,
-                year=int(year),
-                month=int(month),
-            )
+            try:
+                dynamic_features = _monthly_node_features(
+                    data_dir,
+                    state_name=state_name,
+                    year=int(year),
+                    month=int(month),
+                )
+            except FileNotFoundError:
+                # Some states (e.g., IA in late 2023/2024) do not have full
+                # month coverage. Skip missing months instead of failing the
+                # entire split construction.
+                continue
             if dynamic_features.shape[0] != num_nodes:
                 raise ValueError(
                     "Traffic node count mismatch between static and dynamic features: "
@@ -942,6 +948,30 @@ def load_dataset(
                 "train_years": [2009, 2010, 2011, 2012, 2013, 2014],
                 "valid_years": [2015, 2016, 2017, 2018, 2019, 2020],
                 "test_years": [2021, 2022],
+                "months": list(range(1, 13)),
+            },
+            "ia": {
+                "train_years": [2014, 2015, 2016, 2017],
+                "valid_years": [2019, 2020, 2023, 2024],
+                "test_years": [2018, 2021, 2022],
+                "months": list(range(1, 13)),
+            },
+            "nv": {
+                "train_years": [2016, 2017, 2018, 2023],
+                "valid_years": [2019, 2020, 2024],
+                "test_years": [2021, 2022],
+                "months": list(range(1, 13)),
+            },
+            "mt": {
+                "train_years": [2016, 2017, 2018, 2023],
+                "valid_years": [2019, 2020, 2024],
+                "test_years": [2021, 2022],
+                "months": list(range(1, 13)),
+            },
+            "md": {
+                "train_years": [2016, 2017, 2020],
+                "valid_years": [2018, 2019],
+                "test_years": [2015, 2021, 2022],
                 "months": list(range(1, 13)),
             },
         }
