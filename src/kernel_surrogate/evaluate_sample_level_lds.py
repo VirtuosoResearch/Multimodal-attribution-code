@@ -12,14 +12,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.fisher_geometry.data import load_dataset, make_loader
-from src.fisher_geometry.experiment import build_model
-from src.kernel_surrogate.evaluate_kernel_attribution import _resolve_dataset_seed_pairs
-from src.kernel_surrogate.kernel_attribution import (
+from fisher_geometry.data import load_dataset, make_loader
+from fisher_geometry.experiment import build_model
+from kernel_surrogate.evaluate_kernel_attribution import _resolve_dataset_seed_pairs
+from kernel_surrogate.kernel_attribution import (
     DEFAULT_METHODS,
     KernelAttributionConfig,
     MaskBlocks,
@@ -38,10 +43,10 @@ DEFAULT_RESULT_DIR = (
     / "kernel_surrogate"
     / "subset_results"
     / "lds_real_train"
-    / "cross_attention_group_unit_data_keep25_mod_keep90_g50"
+    / "grouped50_subset100_data50_mod50"
 )
-DEFAULT_OUTPUT_JSON = ROOT / "src" / "kernel_surrogate" / "results" / "sample_level_loss_lds_group_keep25_60_40.json"
-DEFAULT_OUTPUT_MD = ROOT / "src" / "kernel_surrogate" / "results" / "sample_level_loss_lds_group_keep25_60_40.md"
+DEFAULT_OUTPUT_JSON = ROOT / "src" / "kernel_surrogate" / "results" / "sample_level_loss_lds_grouped50_subset100_data50_mod50_60_40.json"
+DEFAULT_OUTPUT_MD = ROOT / "src" / "kernel_surrogate" / "results" / "sample_level_loss_lds_grouped50_subset100_data50_mod50_60_40.md"
 DEFAULT_CACHE_DIR = ROOT / "src" / "kernel_surrogate" / "results" / "per_sample_loss_cache"
 EXISTING_LDS_DATASETS = ("imdb", "humor", "sarcasm", "mosi", "mosei", "avmnist")
 
@@ -81,6 +86,7 @@ def main() -> None:
     parser.add_argument("--search-hyperparams", action="store_true")
     parser.add_argument("--search-strategy", choices=["loo", "test"], default="loo")
     parser.add_argument("--ridge-lambda", type=float, default=default_config.ridge_lambda)
+    parser.add_argument("--krr-target-batch-size", type=int, default=512)
     parser.add_argument("--ridge-grid", nargs="+", type=float, default=list(default_config.ridge_grid))
     parser.add_argument("--gamma-scale-grid", nargs="+", type=float, default=list(default_config.gamma_scale_grid))
     parser.add_argument("--modality-shared-grid", nargs="+", type=float, default=list(default_config.modality_shared_grid))
@@ -137,13 +143,19 @@ def main() -> None:
                 test_indices=test_indices,
                 method=method_name,
                 ridge_lambda=args.ridge_lambda,
+                krr_target_batch_size=args.krr_target_batch_size,
                 search_hyperparams=args.search_hyperparams,
                 search_strategy=args.search_strategy,
                 ridge_grid=args.ridge_grid,
                 gamma_scale_grid=args.gamma_scale_grid,
                 modality_shared_grid=args.modality_shared_grid,
             )
-            predictions = predict_multi_target(blocks, fit, query_indices=test_indices)
+            predictions = predict_multi_target(
+                blocks,
+                fit,
+                query_indices=test_indices,
+                target_batch_size=args.krr_target_batch_size,
+            )
             truth = loss_matrix[test_indices]
             sample_lds = samplewise_spearman(predictions, truth)
             row = {
@@ -201,6 +213,7 @@ def main() -> None:
             "search_hyperparams": bool(args.search_hyperparams),
             "search_strategy": str(args.search_strategy),
             "ridge_lambda": float(args.ridge_lambda),
+            "krr_target_batch_size": int(args.krr_target_batch_size),
             "ridge_grid": [float(value) for value in args.ridge_grid],
             "gamma_scale_grid": [float(value) for value in args.gamma_scale_grid],
             "modality_shared_grid": [float(value) for value in args.modality_shared_grid],
@@ -345,6 +358,7 @@ def fit_multi_target_surrogate(
     test_indices: np.ndarray,
     method: str,
     ridge_lambda: float,
+    krr_target_batch_size: int,
     search_hyperparams: bool,
     search_strategy: str,
     ridge_grid: Sequence[float],
@@ -360,6 +374,7 @@ def fit_multi_target_surrogate(
                 train_indices=train_indices,
                 test_indices=test_indices,
                 method=method_name,
+                target_batch_size=krr_target_batch_size,
                 ridge_grid=ridge_grid,
                 gamma_scale_grid=gamma_scale_grid,
                 modality_shared_grid=modality_shared_grid,
@@ -370,6 +385,7 @@ def fit_multi_target_surrogate(
                 targets=targets,
                 train_indices=train_indices,
                 method=method_name,
+                target_batch_size=krr_target_batch_size,
                 ridge_grid=ridge_grid,
                 gamma_scale_grid=gamma_scale_grid,
                 modality_shared_grid=modality_shared_grid,
@@ -390,9 +406,11 @@ def fit_multi_target_surrogate(
     train_targets = targets[train_indices]
     target_mean = train_targets.mean(axis=0)
     centered = train_targets - target_mean
-    alpha = np.linalg.solve(
-        kernel + float(params["ridge_lambda"]) * np.eye(kernel.shape[0], dtype=np.float64),
+    regularized = kernel + float(params["ridge_lambda"]) * np.eye(kernel.shape[0], dtype=np.float64)
+    alpha = batched_solve_multi_target(
+        regularized,
         centered,
+        target_batch_size=krr_target_batch_size,
     )
     return MultiTargetFit(
         method=method_name,
@@ -410,7 +428,13 @@ def fit_multi_target_surrogate(
     )
 
 
-def predict_multi_target(blocks: MaskBlocks, fit: MultiTargetFit, *, query_indices: np.ndarray) -> np.ndarray:
+def predict_multi_target(
+    blocks: MaskBlocks,
+    fit: MultiTargetFit,
+    *,
+    query_indices: np.ndarray,
+    target_batch_size: int,
+) -> np.ndarray:
     kernel, _ = compute_kernel(
         blocks,
         lhs_indices=query_indices,
@@ -422,7 +446,11 @@ def predict_multi_target(blocks: MaskBlocks, fit: MultiTargetFit, *, query_indic
         modality_shared_weight=fit.modality_shared_weight,
         linear_modality_weight=fit.linear_modality_weight,
     )
-    return fit.target_mean + kernel @ fit.alpha
+    return fit.target_mean + batched_right_matmul(
+        kernel,
+        fit.alpha,
+        target_batch_size=target_batch_size,
+    )
 
 
 def search_multi_target_hyperparams(
@@ -431,6 +459,7 @@ def search_multi_target_hyperparams(
     targets: np.ndarray,
     train_indices: np.ndarray,
     method: str,
+    target_batch_size: int,
     ridge_grid: Sequence[float],
     gamma_scale_grid: Sequence[float],
     modality_shared_grid: Sequence[float],
@@ -448,7 +477,12 @@ def search_multi_target_hyperparams(
     )
     for kernel, params in kernel_specs:
         for ridge in ridge_grid:
-            loo_predictions = loo_multi_target_predictions(kernel, train_targets, ridge_lambda=float(ridge))
+            loo_predictions = loo_multi_target_predictions(
+                kernel,
+                train_targets,
+                ridge_lambda=float(ridge),
+                target_batch_size=target_batch_size,
+            )
             sample_lds = samplewise_spearman(loo_predictions, train_targets)
             candidates.append(
                 {
@@ -482,6 +516,7 @@ def search_multi_target_test_hyperparams(
     train_indices: np.ndarray,
     test_indices: np.ndarray,
     method: str,
+    target_batch_size: int,
     ridge_grid: Sequence[float],
     gamma_scale_grid: Sequence[float],
     modality_shared_grid: Sequence[float],
@@ -513,9 +548,11 @@ def search_multi_target_test_hyperparams(
                 linear_modality_weight=params.get("linear_modality_weight"),
             )
             centered = train_targets - train_target_mean
-            alpha = np.linalg.solve(
-                kernel + float(ridge) * np.eye(kernel.shape[0], dtype=np.float64),
+            regularized = kernel + float(ridge) * np.eye(kernel.shape[0], dtype=np.float64)
+            alpha = batched_solve_multi_target(
+                regularized,
                 centered,
+                target_batch_size=target_batch_size,
             )
             test_kernel, _ = compute_kernel(
                 blocks,
@@ -528,7 +565,11 @@ def search_multi_target_test_hyperparams(
                 modality_shared_weight=gammas.get("modality_shared_weight"),
                 linear_modality_weight=gammas.get("linear_modality_weight"),
             )
-            predictions = train_target_mean + test_kernel @ alpha
+            predictions = train_target_mean + batched_right_matmul(
+                test_kernel,
+                alpha,
+                target_batch_size=target_batch_size,
+            )
             sample_lds = samplewise_spearman(predictions, test_targets)
             candidates.append(
                 {
@@ -689,7 +730,13 @@ def make_kernel_specs(
     raise ValueError(f"unsupported method {method!r}")
 
 
-def loo_multi_target_predictions(kernel: np.ndarray, targets: np.ndarray, *, ridge_lambda: float) -> np.ndarray:
+def loo_multi_target_predictions(
+    kernel: np.ndarray,
+    targets: np.ndarray,
+    *,
+    ridge_lambda: float,
+    target_batch_size: int,
+) -> np.ndarray:
     kernel = np.asarray(kernel, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.float64)
     ridge = float(ridge_lambda)
@@ -698,8 +745,16 @@ def loo_multi_target_predictions(kernel: np.ndarray, targets: np.ndarray, *, rid
     # Multi-target KRR: all test samples are solved as RHS columns at once.
     target_mean = targets.mean(axis=0, keepdims=True)
     centered = targets - target_mean
-    alpha = np.linalg.solve(regularized, centered)
-    fitted = target_mean + kernel @ alpha
+    alpha = batched_solve_multi_target(
+        regularized,
+        centered,
+        target_batch_size=target_batch_size,
+    )
+    fitted = target_mean + batched_right_matmul(
+        kernel,
+        alpha,
+        target_batch_size=target_batch_size,
+    )
 
     # Fast KRR leave-one-out prediction via the hat diagonal:
     # residual_loo_i = residual_i / (1 - H_ii), pred_loo_i = y_i - residual_loo_i.
@@ -709,6 +764,42 @@ def loo_multi_target_predictions(kernel: np.ndarray, targets: np.ndarray, *, rid
     denom = np.clip(1.0 - hat_diag, 1e-10, None).reshape(-1, 1)
     residual = targets - fitted
     return targets - residual / denom
+
+
+def batched_solve_multi_target(
+    regularized: np.ndarray,
+    rhs: np.ndarray,
+    *,
+    target_batch_size: int,
+) -> np.ndarray:
+    regularized = np.asarray(regularized, dtype=np.float64)
+    rhs = np.asarray(rhs, dtype=np.float64)
+    if rhs.ndim != 2:
+        raise ValueError(f"expected 2D rhs, got shape {rhs.shape}")
+    batch_size = max(1, int(target_batch_size))
+    outputs = np.empty_like(rhs, dtype=np.float64)
+    for start in range(0, rhs.shape[1], batch_size):
+        stop = min(start + batch_size, rhs.shape[1])
+        outputs[:, start:stop] = np.linalg.solve(regularized, rhs[:, start:stop])
+    return outputs
+
+
+def batched_right_matmul(
+    lhs: np.ndarray,
+    rhs: np.ndarray,
+    *,
+    target_batch_size: int,
+) -> np.ndarray:
+    lhs = np.asarray(lhs, dtype=np.float64)
+    rhs = np.asarray(rhs, dtype=np.float64)
+    if rhs.ndim != 2:
+        raise ValueError(f"expected 2D rhs, got shape {rhs.shape}")
+    batch_size = max(1, int(target_batch_size))
+    outputs = np.empty((lhs.shape[0], rhs.shape[1]), dtype=np.float64)
+    for start in range(0, rhs.shape[1], batch_size):
+        stop = min(start + batch_size, rhs.shape[1])
+        outputs[:, start:stop] = lhs @ rhs[:, start:stop]
+    return outputs
 
 
 def samplewise_spearman(predictions: np.ndarray, targets: np.ndarray) -> np.ndarray:

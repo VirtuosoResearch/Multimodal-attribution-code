@@ -8,13 +8,13 @@ Usage:
     conda activate vlm
 
     # Cross-Attention Transformer (modern)
-    python -m src.fisher_geometry.experiment \
+    python -m fisher_geometry.experiment \
         --model cross_attention \
         --datasets food101 oxford_pets imdb humor sarcasm \
         --seeds 1 2 3 --device cuda:0
 
     # Concat-MLP (baseline)
-    python -m src.fisher_geometry.experiment \
+    python -m fisher_geometry.experiment \
         --model concat_mlp \
         --datasets food101 oxford_pets imdb humor sarcasm \
         --seeds 1 2 3 --device cuda:0
@@ -32,16 +32,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.fisher_geometry.models import (
+from fisher_geometry.models import (
     ConcatFusionModel,
     CrossAttentionFusionModel,
     SharedMLPFusionModel,
 )
-from src.fisher_geometry.fisher_metrics import (
+from fisher_geometry.fisher_metrics import (
     compute_loss,
     per_example_gradients,
     fisher_eigen,
@@ -49,7 +54,7 @@ from src.fisher_geometry.fisher_metrics import (
     residual_energy,
     mean_sample_cosine,
 )
-from src.fisher_geometry.data import load_dataset, permute_aux, make_loader
+from fisher_geometry.data import load_dataset, permute_aux, make_loader
 
 
 # ---------------------------------------------------------------------------

@@ -11,13 +11,18 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.fisher_geometry.data import load_dataset
-from src.kernel_surrogate.kernel_attribution import rmse, spearmanr
-from src.kernel_surrogate.real_data_cmis import (
+from fisher_geometry.data import load_dataset
+from kernel_surrogate.kernel_attribution import rmse, spearmanr
+from kernel_surrogate.real_data_cmis import (
     DEFAULT_PRETRAINED_FULL_CHECKPOINT_ROOT,
     analytical_second_derivative_at_zero,
     build_group_mask_blocks,
@@ -40,7 +45,7 @@ DEFAULT_TRAIN_RESULT_DIR = (
     ROOT
     / "src"
     / "kernel_surrogate"
-    / "result_old"
+    / "results_old"
     / "subset_results"
     / "lds_real_train"
     / "gradest_fullparam_all6_g50_s50_iter5_loss1000"
@@ -88,6 +93,7 @@ def main() -> None:
     parser.add_argument("--random-repeats", type=int, default=200)
     parser.add_argument("--random-seed", type=int, default=123)
     parser.add_argument("--cmis-normalization-eps", type=float, default=1e-12)
+    parser.add_argument("--irev-folds", type=int, default=5)
     parser.add_argument("--output-json", type=Path, default=DEFAULT_OUTPUT_JSON)
     parser.add_argument("--output-md", type=Path, default=DEFAULT_OUTPUT_MD)
     args = parser.parse_args()
@@ -128,6 +134,17 @@ def main() -> None:
             metric = np.eye(num_atoms, dtype=np.float64)
             metric_stats = {}
 
+        embedding_baseline = compute_embedding_cosine_baseline(
+            dataset,
+            train_payload=train_payload,
+            seed=int(args.seed),
+            device=device,
+            feature_device=args.feature_device,
+            pretrained_root=args.pretrained_full_checkpoint_root,
+            fallback_dir=args.full_checkpoint_dir,
+            top_k=int(args.top_k),
+        )
+
         method_rows: list[dict[str, Any]] = []
         for method in args.kernel_methods:
             print(
@@ -156,6 +173,13 @@ def main() -> None:
             cmis_scores = normalize_cmis_scores(raw_scores, eps=float(args.cmis_normalization_eps))
             cmis_ranking = rank_group_pairs(cmis_scores, top_k=int(args.top_k))
             cmis_dominance = summarize_pair_dominance(cmis_ranking["top_pairs"])
+            irev = interaction_residual_explained_variance(
+                eval_blocks,
+                eval_targets,
+                cmis_scores,
+                num_folds=int(args.irev_folds),
+                seed=int(args.random_seed),
+            )
             train_predictions = np.asarray(fit["train_predictions"], dtype=np.float64)
             eval_predictions = predict_surrogate_method(
                 str(method),
@@ -183,6 +207,7 @@ def main() -> None:
                 "ridge_lambda": float(args.ridge_lambda),
                 "gamma": float(fit["gamma"]) if "gamma" in fit else None,
                 "base_gamma": float(fit["base_gamma"]) if "base_gamma" in fit else None,
+                "irev": irev,
                 "cmis_score_summary": {
                     "score_mean": cmis_ranking["score_mean"],
                     "score_std": cmis_ranking["score_std"],
@@ -197,7 +222,8 @@ def main() -> None:
             method_rows.append(row)
             print(
                 f"  {method}: real LDS={row['heldout_lds']:.6f}, "
-                f"Pearson={row['heldout_pearson']:.6f}, RMSE={row['heldout_rmse']:.6f}",
+                f"Pearson={row['heldout_pearson']:.6f}, RMSE={row['heldout_rmse']:.6f}, "
+                f"IREV={row['irev']:.6f}",
                 flush=True,
             )
 
@@ -209,6 +235,15 @@ def main() -> None:
             random_repeats=int(args.random_repeats),
             random_seed=int(args.random_seed),
         )
+        embedding_protocol = run_checkpoint_protocol_a_for_kernel_methods(
+            [embedding_baseline],
+            payload=eval_payload,
+            full_loss=full_loss,
+            top_k=int(args.top_k),
+            random_repeats=int(args.random_repeats),
+            random_seed=int(args.random_seed),
+        )
+        cmis_protocol_a.extend(embedding_protocol)
         cmis_by_method = {str(row["method"]): row for row in cmis_protocol_a}
         for row in method_rows:
             protocol_row = cmis_by_method.get(str(row["method"]))
@@ -235,6 +270,7 @@ def main() -> None:
                 "metric_stats": metric_stats,
                 "methods": method_rows,
                 "cmis_protocol_a": cmis_protocol_a,
+                "embedding_baseline": embedding_baseline,
             }
         )
 
@@ -257,6 +293,7 @@ def main() -> None:
             "top_k": int(args.top_k),
             "random_repeats": int(args.random_repeats),
             "random_seed": int(args.random_seed),
+            "irev_folds": int(args.irev_folds),
         },
         "summary": summarize_records(records),
         "cmis_protocol_a_summary": summarize_cmis_protocol_a(dataset_results),
@@ -346,6 +383,84 @@ def compute_metric_for_dataset(
     return build_metric(gradients, normalization=metric_normalization)
 
 
+def compute_embedding_cosine_baseline(
+    dataset: str,
+    *,
+    train_payload: dict[str, Any],
+    seed: int,
+    device: torch.device,
+    feature_device: str | None,
+    pretrained_root: Path,
+    fallback_dir: Path,
+    top_k: int,
+) -> dict[str, Any]:
+    config = dict(train_payload["config"])
+    data = load_dataset(
+        dataset,
+        seed,
+        text_backbone=str(config.get("text_backbone", "clip_cached")),
+        vision_backbone=str(config.get("vision_backbone", "clip_cached")),
+        feature_device=str(feature_device or config.get("feature_device", device)),
+        backbone_batch_size=int(config.get("backbone_batch_size", 32)),
+        download_datasets=bool(config.get("download_datasets", False)),
+        backbone_cache_dir=config.get("backbone_cache_dir"),
+    )
+    model_args = make_model_args(config, device=str(device))
+    full_checkpoint = resolve_full_checkpoint_path(
+        dataset=dataset,
+        seed=seed,
+        pretrained_root=pretrained_root,
+        fallback_dir=fallback_dir,
+    )
+    model, _ = load_or_train_full_model(
+        full_checkpoint,
+        data=data,
+        task=str(data["task"]),
+        dim_x=int(data["train_x"].shape[1]),
+        dim_y=int(data["train_y"].shape[1]),
+        num_classes=int(data["num_classes"]),
+        model_args=model_args,
+        model_type=str(config.get("model", "cross_attention")),
+        seed=seed,
+        force_train=False,
+    )
+    model.to(device)
+    model.eval()
+    print(f"[{dataset}] computing group-average embedding cosine baseline on {device}...", flush=True)
+    with torch.inference_mode():
+        emb_x, emb_y = model.get_embedding(data["train_x"].to(device), data["train_y"].to(device))
+    emb_x_np = emb_x.detach().cpu().numpy().astype(np.float64, copy=False)
+    emb_y_np = emb_y.detach().cpu().numpy().astype(np.float64, copy=False)
+    group_indices = [
+        np.asarray(indices, dtype=np.int64)
+        for indices in train_payload["group_partition"]["group_indices"]
+    ]
+    group_x = np.stack([emb_x_np[idx].mean(axis=0) for idx in group_indices], axis=0)
+    group_y = np.stack([emb_y_np[idx].mean(axis=0) for idx in group_indices], axis=0)
+    group_x = _row_normalize(group_x)
+    group_y = _row_normalize(group_y)
+    scores = group_x @ group_y.T
+    ranking = rank_group_pairs(scores, top_k=top_k)
+    return {
+        "method": "embedding_cosine",
+        "top_pairs": ranking["top_pairs"],
+        "top_pair_dominance": summarize_pair_dominance(ranking["top_pairs"]),
+        "cmis_score_summary": {
+            "score_mean": ranking["score_mean"],
+            "score_std": ranking["score_std"],
+            "score_min": ranking["score_min"],
+            "score_max": ranking["score_max"],
+            "positive_fraction": ranking["positive_fraction"],
+        },
+    }
+
+
+def _row_normalize(matrix: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.maximum(norms, eps)
+
+
 def make_model_args(config: dict[str, Any], *, device: str) -> SimpleNamespace:
     return SimpleNamespace(
         hidden_dim=int(config.get("hidden_dim", 256)),
@@ -372,6 +487,65 @@ def pearsonr(lhs: Sequence[float] | np.ndarray, rhs: Sequence[float] | np.ndarra
     return float(np.sum(left * right) / denom)
 
 
+def interaction_residual_explained_variance(
+    eval_blocks: dict[str, np.ndarray],
+    eval_targets: np.ndarray,
+    cmis_scores: np.ndarray,
+    *,
+    num_folds: int,
+    seed: int,
+) -> float:
+    z1 = np.asarray(eval_blocks["modality_deleted"][:, 0::2], dtype=np.float64)
+    z2 = np.asarray(eval_blocks["modality_deleted"][:, 1::2], dtype=np.float64)
+    targets = np.asarray(eval_targets, dtype=np.float64)
+    num_items = targets.shape[0]
+    if num_items < 3:
+        return float("nan")
+    num_folds = max(2, min(int(num_folds), num_items))
+    order = np.random.default_rng(seed).permutation(num_items)
+    folds = np.array_split(order, num_folds)
+    heldout_residuals: list[np.ndarray] = []
+    heldout_predictions: list[np.ndarray] = []
+    interaction_matrix = np.asarray(cmis_scores, dtype=np.float64).copy()
+    np.fill_diagonal(interaction_matrix, 0.0)
+
+    for fold in folds:
+        test_idx = np.sort(fold.astype(np.int64, copy=False))
+        train_idx = np.setdiff1d(np.arange(num_items, dtype=np.int64), test_idx, assume_unique=True)
+        if train_idx.size < 2 or test_idx.size == 0:
+            continue
+        additive_train = additive_design(z1[train_idx], z2[train_idx])
+        additive_test = additive_design(z1[test_idx], z2[test_idx])
+        coef, *_ = np.linalg.lstsq(additive_train, targets[train_idx], rcond=None)
+        residual_train = targets[train_idx] - additive_train @ coef
+        residual_test = targets[test_idx] - additive_test @ coef
+
+        activation_train = interaction_activation_score(z1[train_idx], z2[train_idx], interaction_matrix)
+        activation_test = interaction_activation_score(z1[test_idx], z2[test_idx], interaction_matrix)
+        denom = float(np.dot(activation_train, activation_train))
+        eta = 0.0 if denom <= 1e-12 else float(np.dot(activation_train, residual_train) / denom)
+        heldout_residuals.append(residual_test)
+        heldout_predictions.append(eta * activation_test)
+
+    if not heldout_residuals:
+        return float("nan")
+    residuals = np.concatenate(heldout_residuals, axis=0)
+    predictions = np.concatenate(heldout_predictions, axis=0)
+    denom = float(np.sum(residuals**2))
+    if denom <= 1e-12 or not math.isfinite(denom):
+        return float("nan")
+    return float(1.0 - np.sum((residuals - predictions) ** 2) / denom)
+
+
+def additive_design(z1: np.ndarray, z2: np.ndarray) -> np.ndarray:
+    intercept = np.ones((z1.shape[0], 1), dtype=np.float64)
+    return np.concatenate([intercept, z1, z2], axis=1)
+
+
+def interaction_activation_score(z1: np.ndarray, z2: np.ndarray, interaction_matrix: np.ndarray) -> np.ndarray:
+    return np.sum((z1 @ interaction_matrix) * z2, axis=1)
+
+
 def summarize_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     by_method: dict[str, list[dict[str, Any]]] = {}
     for record in records:
@@ -386,6 +560,8 @@ def summarize_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]
                 "std_heldout_lds": float(np.nanstd([row["heldout_lds"] for row in rows])),
                 "mean_heldout_pearson": float(np.nanmean([row["heldout_pearson"] for row in rows])),
                 "mean_heldout_rmse": float(np.nanmean([row["heldout_rmse"] for row in rows])),
+                "mean_irev": float(np.nanmean([row["irev"] for row in rows])),
+                "std_irev": float(np.nanstd([row["irev"] for row in rows])),
                 "mean_train_lds": float(np.nanmean([row["train_lds"] for row in rows])),
                 "mean_train_rmse": float(np.nanmean([row["train_rmse"] for row in rows])),
             }
@@ -460,6 +636,17 @@ def to_markdown(payload: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "## IREV Summary",
+            "",
+            "| method | mean IREV | std IREV |",
+            "| --- | ---: | ---: |",
+        ]
+    )
+    for row in payload["summary"]:
+        lines.append(f"| {row['method']} | {row['mean_irev']:.6g} | {row['std_irev']:.6g} |")
+    lines.extend(
+        [
+            "",
             "## CMIS Protocol A Summary",
             "",
             "| method | mean effect size | std effect size | mean high increase | mean random increase | mean observations |",
@@ -477,8 +664,8 @@ def to_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Per Dataset",
             "",
-            "| dataset | method | real LDS | real Pearson | real RMSE | grad-train LDS | train subsets | real subsets |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| dataset | method | real LDS | real Pearson | real RMSE | IREV | grad-train LDS | train subsets | real subsets |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for dataset_result in payload["dataset_results"]:
@@ -486,7 +673,7 @@ def to_markdown(payload: dict[str, Any]) -> str:
         for row in dataset_result["methods"]:
             lines.append(
                 f"| {dataset} | {row['method']} | {row['heldout_lds']:.6g} | "
-                f"{row['heldout_pearson']:.6g} | {row['heldout_rmse']:.6g} | "
+                f"{row['heldout_pearson']:.6g} | {row['heldout_rmse']:.6g} | {row['irev']:.6g} | "
                 f"{row['train_lds']:.6g} | {row['num_train_subsets']} | {row['num_eval_subsets']} |"
             )
     lines.extend(
