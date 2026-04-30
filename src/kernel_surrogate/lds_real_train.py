@@ -13,16 +13,21 @@ import torch.nn.functional as F
 from torch.func import functional_call, jvp
 from torch.utils.data import DataLoader
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from src.fisher_geometry.data import load_dataset, make_loader
-from src.fisher_geometry.experiment import build_model, set_seed
-from src.fisher_geometry.fisher_metrics import compute_loss
+from fisher_geometry.data import load_dataset, make_loader
+from fisher_geometry.experiment import build_model, set_seed
+from fisher_geometry.fisher_metrics import compute_loss
 try:
     from src.pid_estimator.subset_loader import build_grouped_subset_loader
 except ModuleNotFoundError:
@@ -123,7 +128,7 @@ def _default_run_name(args: argparse.Namespace) -> str:
     num_repeats = len(args.train_repeat_seeds)
     base = (
         f"{args.model}_"
-        "group_unit_"
+        f"group_unit_{args.group_method}_"
         f"data_keep{_rate_token(args.data_keep_rate)}_"
         f"mod_keep{_rate_token(args.modality_keep_rate)}_"
         f"g{args.num_groups}_"
@@ -681,8 +686,9 @@ def _run_gradient_estimation_subset(
 
 
 def _train_model(
-    train_loader: DataLoader,
+    train_loaders: list[DataLoader],
     *,
+    loader_epochs: list[int],
     dim_x: int,
     dim_y: int,
     num_classes: int,
@@ -691,30 +697,40 @@ def _train_model(
     args: argparse.Namespace,
     seed: int,
 ) -> tuple[torch.nn.Module, list[float]]:
+    if len(train_loaders) != len(loader_epochs):
+        raise ValueError("train_loaders and loader_epochs must have the same length")
+    if any(int(num_epochs) < 0 for num_epochs in loader_epochs):
+        raise ValueError("loader_epochs must be non-negative")
+    if sum(int(num_epochs) for num_epochs in loader_epochs) != int(args.epochs):
+        raise ValueError(
+            f"loader_epochs must sum to args.epochs={int(args.epochs)}, got {loader_epochs}"
+        )
+
     set_seed(seed)
     model = build_model(model_type, dim_x, dim_y, num_classes, args).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     epoch_losses: list[float] = []
 
-    for _ in range(args.epochs):
-        model.train()
-        running_loss = 0.0
-        total_samples = 0
-        for bx, by, bl in train_loader:
-            bx = bx.to(args.device)
-            by = by.to(args.device)
-            bl = bl.to(args.device)
+    for train_loader, num_epochs in zip(train_loaders, loader_epochs):
+        for _ in range(int(num_epochs)):
+            model.train()
+            running_loss = 0.0
+            total_samples = 0
+            for bx, by, bl in train_loader:
+                bx = bx.to(args.device)
+                by = by.to(args.device)
+                bl = bl.to(args.device)
 
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(bx, by, use_x=True, use_y=True)
-            loss = compute_loss(task, logits, bl)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(bx, by, use_x=True, use_y=True)
+                loss = compute_loss(task, logits, bl)
+                loss.backward()
+                optimizer.step()
 
-            batch_size = int(bl.shape[0])
-            running_loss += float(loss.item()) * batch_size
-            total_samples += batch_size
-        epoch_losses.append(running_loss / max(total_samples, 1))
+                batch_size = int(bl.shape[0])
+                running_loss += float(loss.item()) * batch_size
+                total_samples += batch_size
+            epoch_losses.append(running_loss / max(total_samples, 1))
 
     model.eval()
     return model, epoch_losses
@@ -778,6 +794,7 @@ def _sample_subset_specs(
 def _group_partition_payload(grouped_loader) -> dict[str, Any]:
     return {
         "cache_path": str(grouped_loader.cache_path),
+        "group_method": str(grouped_loader.metadata.group_method),
         "num_groups": int(grouped_loader.num_groups),
         "num_modalities": int(grouped_loader.num_modalities),
         "modality_names": [str(name) for name in grouped_loader.modality_names],
@@ -818,6 +835,7 @@ def _subset_group_index_payload(
         "sample_index": int(sample_index),
         "subset_seed": int(subset_seed),
         "num_groups": int(grouped_loader.num_groups),
+        "group_method": str(grouped_loader.metadata.group_method),
         "num_modalities": int(grouped_loader.num_modalities),
         "modality_names": [str(name) for name in grouped_loader.modality_names],
         "group_cache_path": str(grouped_loader.cache_path),
@@ -1049,6 +1067,7 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
         dataset_name=dataset_name,
         num_groups=args.num_groups,
         seed=partition_seed,
+        group_method=args.group_method,
         cache_dir=args.group_cache_dir,
     )
     groups_per_subset = _resolved_groups_per_subset(grouped_loader.num_groups, args.data_keep_rate)
@@ -1121,6 +1140,9 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
         args.eval_batch_size,
         False,
     )
+    # full_train_epochs = int(args.epochs) // 2
+    full_train_epochs = 0
+    subset_train_epochs = int(args.epochs) - full_train_epochs
     gradient_model: torch.nn.Module | None = None
     test_base_logits: torch.Tensor | None = None
     test_projected_logits: torch.Tensor | None = None
@@ -1281,7 +1303,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                     flush=True,
                 )
                 model, epoch_losses = _train_model(
-                    subset_train_loader,
+                    [base_train_loader, subset_train_loader],
+                    loader_epochs=[full_train_epochs, subset_train_epochs],
                     dim_x=dim_x,
                     dim_y=dim_y,
                     num_classes=num_classes,
@@ -1339,6 +1362,7 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                         "sample_index": int(offset),
                         "subset_artifact_relpath": str(subset_artifact_relpath),
                         "num_groups": int(grouped_loader.num_groups),
+                        "group_method": str(grouped_loader.metadata.group_method),
                         "groups_per_subset": int(groups_per_subset),
                         "selected_group_count": int(len(group_ids)),
                         "group_ids": [int(group_id) for group_id in group_ids],
@@ -1348,6 +1372,8 @@ def run_single(dataset_name: str, seed: int, args: argparse.Namespace) -> dict[s
                         "effective_sample_count": effective_sample_count,
                         "test_metrics": scalar_test_metrics,
                         "epoch_losses": [float(loss) for loss in epoch_losses],
+                        "full_train_epochs": int(full_train_epochs),
+                        "subset_train_epochs": int(subset_train_epochs),
                         "group_cache_path": str(grouped_loader.cache_path),
                         "group_index_path": str(group_index_path),
                         "result_json_path": str(metric_path),
@@ -1492,7 +1518,8 @@ def main() -> None:
     parser.add_argument("--proj-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--num-groups", type=int, default=50)
+    parser.add_argument("--num-groups", type=int, default=25)
+    parser.add_argument("--group-method", choices=["random", "kmeans"], default="kmeans")
     parser.add_argument("--data-keep-rate", type=float, default=0.25)
     parser.add_argument("--modality-keep-rate", type=float, default=0.9)
     parser.add_argument("--data-missing-rate", type=float, default=None)
