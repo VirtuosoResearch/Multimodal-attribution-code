@@ -9,12 +9,17 @@ from typing import Any
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.kernel_surrogate.evaluate_kernel_attribution import _resolve_dataset_seed_pairs
-from src.kernel_surrogate.evaluate_sample_level_lds import (
+from kernel_surrogate.evaluate_kernel_attribution import _resolve_dataset_seed_pairs
+from kernel_surrogate.evaluate_sample_level_lds import (
     DEFAULT_CACHE_DIR,
     EXISTING_LDS_DATASETS,
     MultiTargetFit,
@@ -24,7 +29,7 @@ from src.kernel_surrogate.evaluate_sample_level_lds import (
     samplewise_spearman,
     summarize_sample_level_records,
 )
-from src.kernel_surrogate.kernel_attribution import (
+from kernel_surrogate.kernel_attribution import (
     DEFAULT_METHODS,
     KernelAttributionConfig,
     MaskBlocks,

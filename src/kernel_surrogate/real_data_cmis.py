@@ -11,15 +11,20 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.fisher_geometry.data import load_dataset, make_loader
-from src.fisher_geometry.experiment import build_model
-from src.fisher_geometry.fisher_metrics import compute_loss
-from src.kernel_surrogate.kernel_attribution import rmse, spearmanr
-from src.kernel_surrogate.lds_real_train import _evaluate_classifier, _train_model
+from fisher_geometry.data import load_dataset, make_loader
+from fisher_geometry.experiment import build_model
+from fisher_geometry.fisher_metrics import compute_loss
+from kernel_surrogate.kernel_attribution import rmse, spearmanr
+from kernel_surrogate.lds_real_train import _evaluate_classifier, _train_model
 
 
 DEFAULT_RESULT_DIR = (

@@ -1,2 +1,1 @@
-"""Kernel-surrogate training utilities."""
-
+"""Kernel surrogate experiments and utilities."""

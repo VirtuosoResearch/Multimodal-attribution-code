@@ -6,7 +6,7 @@ Quadrature. Also computes the interaction Hessian H_XY - H_X - H_Y.
 
 Usage:
     conda activate vlm
-    python -m src.fisher_geometry.experiment_hessian \
+    python -m fisher_geometry.experiment_hessian \
         --model cross_attention \
         --datasets imdb humor sarcasm mosi mosei avmnist oxford_pets \
         --seeds 1 2 3 --device cuda:0
@@ -23,18 +23,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.fisher_geometry.models import (
+from fisher_geometry.models import (
     ConcatFusionModel,
     CrossAttentionFusionModel,
     SharedMLPFusionModel,
 )
-from src.fisher_geometry.fisher_metrics import compute_loss
-from src.fisher_geometry.data import load_dataset, permute_aux, make_loader
-from src.fisher_geometry.experiment import (
+from fisher_geometry.fisher_metrics import compute_loss
+from fisher_geometry.data import load_dataset, permute_aux, make_loader
+from fisher_geometry.experiment import (
     set_seed, evaluate, build_model,
 )
 from src.slq.slq import SLQ

@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from src.kernel_surrogate.real_data_cmis import to_markdown
+from kernel_surrogate.real_data_cmis import to_markdown
 
 
 DEFAULT_DATASETS = ("avmnist", "humor", "imdb", "mosei", "mosi", "sarcasm")

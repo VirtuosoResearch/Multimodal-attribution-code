@@ -10,13 +10,18 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.fisher_geometry.data import load_dataset, make_loader
-from src.fisher_geometry.experiment import build_model
-from src.kernel_surrogate.kernel_attribution import (
+from fisher_geometry.data import load_dataset, make_loader
+from fisher_geometry.experiment import build_model
+from kernel_surrogate.kernel_attribution import (
     DEFAULT_METHODS,
     KernelAttributionConfig,
     MaskBlocks,
@@ -28,7 +33,7 @@ from src.kernel_surrogate.kernel_attribution import (
     rmse,
     spearmanr,
 )
-from src.kernel_surrogate.lds_real_train import _per_sample_loss, _train_model
+from kernel_surrogate.lds_real_train import _per_sample_loss, _train_model
 
 try:
     from src.pid_estimator.subset_loader import build_grouped_subset_loader

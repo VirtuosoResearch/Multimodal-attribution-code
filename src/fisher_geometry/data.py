@@ -17,7 +17,12 @@ import torch
 from torchvision import datasets as tv_datasets
 from torch.utils.data import DataLoader, TensorDataset
 
-ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+for path in (REPO_ROOT, SOURCE_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+ROOT = REPO_ROOT
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 # opt_motivation/core.py lives in the old repo copy
