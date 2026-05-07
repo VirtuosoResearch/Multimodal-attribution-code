@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer, pipeline, BertModel
 import h5py
+import os
 import pickle
 import numpy as np
 
@@ -222,14 +223,19 @@ def bert_version_data(data, raw_path, keys, max_padding=50, bert_max_len=None):
 
 
 if __name__ == '__main__':
+    datasets_root = os.environ.get("MULTIBENCH_DATASETS_ROOT", os.path.join("data", "datasets"))
+    sarcasm_path = os.environ.get(
+        "SARCASM_DATA_PATH",
+        os.path.join(datasets_root, "sarcasm", "sarcasm.pkl"))
+    raw_path = os.environ.get(
+        "SARCASM_RAW_TEXT_PATH",
+        os.path.join(datasets_root, "sarcasm", "sarcasm_raw_text.pkl"))
 
-    with open('/home/pliang/multibench/affect/sarcasm.pkl', "rb") as f:
+    with open(sarcasm_path, "rb") as f:
         alldata = pickle.load(f)
 
     train_keys = list(alldata['train']['id'])
     print(alldata['train']['vision'].shape)
-
-    raw_path = '/home/pliang/multibench/affect/sarcasm_raw_text.pkl'
 
     new_train_data = bert_version_data(alldata['train'], raw_path, train_keys)
 

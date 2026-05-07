@@ -271,7 +271,7 @@ class Affectdataset(Dataset):
 def get_dataloader(
         filepath: str, batch_size: int = 32, max_seq_len=50, max_pad=False, train_shuffle: bool = True,
         num_workers: int = 2, flatten_time_series: bool = False, task=None, robust_test=False, data_type='mosi', 
-        raw_path='/home/van/backup/pack/mosi/mosi.hdf5', z_norm=False, vision_norm=False) -> DataLoader:
+        raw_path=None, z_norm=False, vision_norm=False) -> DataLoader:
     """Get dataloaders for affect data.
 
     Args:
@@ -285,7 +285,7 @@ def get_dataloader(
         task (str, optional): Which task to load in. Defaults to None.
         robust_test (bool, optional): Whether to apply robustness to data or not. Defaults to False.
         data_type (str, optional): What data to load in. Defaults to 'mosi'.
-        raw_path (str, optional): Full path to data. Defaults to '/home/van/backup/pack/mosi/mosi.hdf5'.
+        raw_path (str, optional): Full path to raw data. Defaults to the AFFECT_RAW_PATH environment variable.
         z_norm (bool, optional): Whether to normalize data along the z dimension or not. Defaults to False.
         vision_norm (bool, optional): Whether to normalize vision data or not. Defaults to False.
     Returns:
@@ -316,6 +316,9 @@ def get_dataloader(
     #                   collate_fn=process)
     if robust_test:
         vids = [id for id in alldata['test']['id']]
+        raw_path = raw_path or os.environ.get("AFFECT_RAW_PATH")
+        if raw_path is None:
+            raise ValueError("raw_path is required for robust_test. Set AFFECT_RAW_PATH or pass raw_path explicitly.")
 
         file_type = raw_path.split('.')[-1]  # hdf5
         rawtext, vids = get_rawtext(raw_path, file_type, vids)

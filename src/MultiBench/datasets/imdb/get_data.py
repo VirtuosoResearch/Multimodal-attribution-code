@@ -14,7 +14,9 @@ import sys
 from typing import *
 import numpy as np
 
-sys.path.append('/home/pliang/multibench/MultiBench/datasets/imdb')
+IMDB_DIR = os.path.dirname(os.path.abspath(__file__))
+if IMDB_DIR not in sys.path:
+    sys.path.append(IMDB_DIR)
 
 
 class IMDBDataset(Dataset):
@@ -144,10 +146,15 @@ def get_dataloader(path: str, test_path: str, num_workers: int = 8, train_shuffl
     dataset = os.path.join(test_path, "dataset")
 
     if not skip_process:
+        imdb_asset_dir = os.environ.get("MULTIBENCH_IMDB_ASSET_DIR", IMDB_DIR)
         clsf = VGGClassifier(
-            model_path='/home/pliang/multibench/MultiBench/datasets/imdb/vgg16.tar', synset_words='synset_words.txt')
+            model_path=os.path.join(imdb_asset_dir, 'vgg16.tar'),
+            synset_words=os.path.join(imdb_asset_dir, 'synset_words.txt'))
+        word2vec_path = os.environ.get(
+            "GOOGLE_WORD2VEC_PATH",
+            os.path.join(imdb_asset_dir, 'GoogleNews-vectors-negative300.bin.gz'))
         googleword2vec = KeyedVectors.load_word2vec_format(
-            '/home/pliang/multibench/MultiBench/datasets/imdb/GoogleNews-vectors-negative300.bin.gz', binary=True)
+            word2vec_path, binary=True)
 
         images = []
         texts = []

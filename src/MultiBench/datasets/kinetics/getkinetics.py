@@ -53,5 +53,5 @@ def getkinetics(datafolder, tempfolder, categorylist, frames_per_instance, frame
     return datas
 
 
-#a = getkinetics('/home/yiwei/kinetics/ActivityNet/Crawler/Kinetics/train_data',
-#               '/home/yiwei/kinetics/ActivityNet/Crawler/Kinetics/temp', ['archery'], 150, 2, (224, 224))
+# a = getkinetics('path/to/kinetics/train_data',
+#                 'path/to/kinetics/temp', ['archery'], 150, 2, (224, 224))

@@ -33,8 +33,8 @@ setup(
     url='https://github.com/vzhong/rtfm',
 
     # Author details
-    author='Victor Zhong',
-    author_email='victor@victorzhong.com',
+    author='RTFM contributors',
+    author_email='',
 
     # Choose your license
     license='MIT',

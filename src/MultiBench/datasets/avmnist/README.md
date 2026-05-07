@@ -1,4 +1,4 @@
 The data files are too big so they are not on Github.
 
-You can fetch them from /data/yiwei/avmnist/_MFAS/avmnist
-and use this folder as the data_dir when using get
+Place the AV-MNIST files under your local dataset root, for example
+`data/datasets/avmnist`, and use that folder as `data_dir` when loading it.
