@@ -216,3 +216,176 @@ class CrossAttentionFusionModel(nn.Module):
         pool_y = seq_y[:, 0] if use_y else self.null_embed.expand(B, -1)
         pooled = torch.cat([pool_x, pool_y], dim=1)
         return self.classifier(self.pool_norm(pooled))
+
+
+class TrafficPairGNNMLPFusionModel(nn.Module):
+    """Traffic fusion model: tabular pair-GNN branch + vision MLP branch.
+
+    Expects x modality in layout:
+        [edge_tabular, node_u_tabular, node_v_tabular]
+    where node_u/node_v chunks share the same dimension.
+
+    The x branch first runs several message-passing style updates on the
+    (u, v) node pair conditioned on edge features, then feeds pooled pair
+    features into an MLP.
+
+    The y branch mirrors the original traffic vision usage more explicitly:
+    feat_y is split as [vision_u, vision_v], each endpoint is encoded with a
+    shared vision MLP, and pair features are aggregated before fusion.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim_y: int,
+        y_node_dim: int,
+        x_node_dim: int,
+        x_edge_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        message_passing_layers: int = 2,
+        classifier_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.y_node_dim = int(y_node_dim)
+        self.expected_y_dim = int(2 * self.y_node_dim)
+        self.x_node_dim = int(x_node_dim)
+        self.x_edge_dim = int(x_edge_dim)
+        self.expected_x_dim = int(self.x_edge_dim + 2 * self.x_node_dim)
+        self.hidden_dim = int(hidden_dim)
+        if int(dim_y) != self.expected_y_dim:
+            raise ValueError(
+                "TrafficPairGNNMLPFusionModel expected y dimension "
+                f"{self.expected_y_dim}, got {int(dim_y)}. "
+                "Please verify traffic_vision_node_dim."
+            )
+
+        self.node_proj = nn.Linear(self.x_node_dim, self.hidden_dim)
+        self.edge_proj = (
+            nn.Linear(self.x_edge_dim, self.hidden_dim)
+            if self.x_edge_dim > 0
+            else None
+        )
+        self.msg_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                for _ in range(max(int(message_passing_layers), 1))
+            ]
+        )
+        self.msg_norm_u = nn.ModuleList([nn.LayerNorm(self.hidden_dim) for _ in self.msg_layers])
+        self.msg_norm_v = nn.ModuleList([nn.LayerNorm(self.hidden_dim) for _ in self.msg_layers])
+
+        self.x_head = nn.Sequential(
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.y_node_head = nn.Sequential(
+            nn.Linear(self.y_node_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.y_pair_head = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        self.null_x = nn.Parameter(torch.zeros(1, self.hidden_dim))
+        self.null_y = nn.Parameter(torch.zeros(1, self.hidden_dim))
+        self.fusion_norm = nn.LayerNorm(self.hidden_dim * 2)
+
+        layers: list[nn.Module] = []
+        in_dim = self.hidden_dim * 2
+        for _ in range(max(int(classifier_layers) - 1, 0)):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, self.hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            in_dim = self.hidden_dim
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.classifier = nn.Sequential(*layers)
+
+    def _split_x(self, feat_x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if int(feat_x.shape[1]) != self.expected_x_dim:
+            raise ValueError(
+                "TrafficPairGNNMLPFusionModel expected x dimension "
+                f"{self.expected_x_dim}, got {int(feat_x.shape[1])}. "
+                "Please verify traffic_edge_tabular_dim/traffic_node_tabular_dim."
+            )
+        edge_end = self.x_edge_dim
+        node_u_end = edge_end + self.x_node_dim
+        edge = feat_x[:, :edge_end] if self.x_edge_dim > 0 else feat_x.new_zeros(feat_x.shape[0], 0)
+        node_u = feat_x[:, edge_end:node_u_end]
+        node_v = feat_x[:, node_u_end:]
+        return edge, node_u, node_v
+
+    def _encode_x(self, feat_x: torch.Tensor) -> torch.Tensor:
+        edge, node_u, node_v = self._split_x(feat_x)
+        hu = self.node_proj(node_u)
+        hv = self.node_proj(node_v)
+        if self.edge_proj is not None:
+            he = self.edge_proj(edge)
+        else:
+            he = hu.new_zeros(hu.shape[0], self.hidden_dim)
+
+        for index, msg_layer in enumerate(self.msg_layers):
+            msg_u = msg_layer(torch.cat([hu, hv, he], dim=1))
+            msg_v = msg_layer(torch.cat([hv, hu, he], dim=1))
+            hu = self.msg_norm_u[index](hu + msg_u)
+            hv = self.msg_norm_v[index](hv + msg_v)
+
+        pair_features = torch.cat([hu, hv, torch.abs(hu - hv), he], dim=1)
+        return self.x_head(pair_features)
+
+    def _encode_y(self, feat_y: torch.Tensor) -> torch.Tensor:
+        if int(feat_y.shape[1]) != self.expected_y_dim:
+            raise ValueError(
+                "TrafficPairGNNMLPFusionModel expected y dimension "
+                f"{self.expected_y_dim}, got {int(feat_y.shape[1])}. "
+                "Please verify traffic_vision_node_dim."
+            )
+        vision_u = feat_y[:, : self.y_node_dim]
+        vision_v = feat_y[:, self.y_node_dim :]
+        hu = self.y_node_head(vision_u)
+        hv = self.y_node_head(vision_v)
+        pair = torch.cat([hu, hv, torch.abs(hu - hv)], dim=1)
+        return self.y_pair_head(pair)
+
+    def forward(
+        self,
+        feat_x: torch.Tensor,
+        feat_y: torch.Tensor,
+        *,
+        use_x: bool = True,
+        use_y: bool = True,
+    ) -> torch.Tensor:
+        batch_size = int(feat_x.shape[0])
+        if use_x:
+            x_repr = self._encode_x(feat_x)
+        else:
+            x_repr = self.null_x.expand(batch_size, -1)
+        if use_y:
+            y_repr = self._encode_y(feat_y)
+        else:
+            y_repr = self.null_y.expand(batch_size, -1)
+        fused = torch.cat([x_repr, y_repr], dim=1)
+        return self.classifier(self.fusion_norm(fused))

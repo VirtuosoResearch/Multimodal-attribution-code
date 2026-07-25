@@ -45,6 +45,7 @@ from fisher_geometry.models import (
     ConcatFusionModel,
     CrossAttentionFusionModel,
     SharedMLPFusionModel,
+    TrafficPairGNNMLPFusionModel,
 )
 from fisher_geometry.fisher_metrics import (
     compute_loss,
@@ -150,8 +151,16 @@ def evaluate(model: nn.Module, x: torch.Tensor, y: torch.Tensor,
 # Model factory
 # ---------------------------------------------------------------------------
 
-def build_model(model_type: str, dim_x: int, dim_y: int,
-                num_classes: int, args: argparse.Namespace) -> nn.Module:
+def build_model(
+    model_type: str,
+    dim_x: int,
+    dim_y: int,
+    num_classes: int,
+    args: argparse.Namespace,
+    *,
+    model_kwargs: dict[str, Any] | None = None,
+) -> nn.Module:
+    model_kwargs = model_kwargs or {}
     if model_type == "concat_mlp":
         return ConcatFusionModel(
             dim_x, dim_y, hidden_dim=args.hidden_dim,
@@ -165,6 +174,27 @@ def build_model(model_type: str, dim_x: int, dim_y: int,
             dim_x, dim_y, proj_dim=args.proj_dim,
             num_heads=args.num_heads, num_layers=args.num_layers,
             num_classes=num_classes, dropout=args.dropout)
+    elif model_type == "traffic_pair_gnn_mlp":
+        if (
+            "x_node_dim" not in model_kwargs
+            or "x_edge_dim" not in model_kwargs
+            or "y_node_dim" not in model_kwargs
+        ):
+            raise ValueError(
+                "traffic_pair_gnn_mlp requires model_kwargs with "
+                "x_node_dim, x_edge_dim, and y_node_dim"
+            )
+        return TrafficPairGNNMLPFusionModel(
+            dim_y=dim_y,
+            y_node_dim=int(model_kwargs["y_node_dim"]),
+            x_node_dim=int(model_kwargs["x_node_dim"]),
+            x_edge_dim=int(model_kwargs["x_edge_dim"]),
+            hidden_dim=args.hidden_dim,
+            num_classes=num_classes,
+            message_passing_layers=int(getattr(args, "traffic_gnn_layers", 2)),
+            classifier_layers=int(getattr(args, "traffic_classifier_layers", 2)),
+            dropout=args.dropout,
+        )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
