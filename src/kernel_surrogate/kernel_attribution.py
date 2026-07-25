@@ -18,7 +18,11 @@ DEFAULT_METHODS = (
     "kernel_surrogate_2_linear",
     "kernel_surrogate_hier_linear",
     "kernel_surrogate_hier_centered_linear",
+    "influence_function_linear",
     "raw_flat_rbf",
+    "hamming_distance_kernel",
+    "l2_laplacian_kernel",
+    "second_order_polynomial_kernel",
 )
 
 
@@ -637,10 +641,91 @@ def search_kernel_hyperparams(
                         "loo_rmse": rmse(loo_predictions, targets),
                     }
                 )
+    elif method_name == "hamming_distance_kernel":
+        flat_dist = pairwise_hamming_distance(
+            blocks.flat_deleted[train_indices],
+            blocks.flat_deleted[train_indices],
+        )
+        base_gamma_flat = median_heuristic_gamma(flat_dist)
+        for scale in gamma_scale_grid:
+            gamma_flat = float(base_gamma_flat * float(scale))
+            kernel = np.exp(-gamma_flat * flat_dist)
+            for ridge in ridge_grid:
+                loo_predictions = _loo_predictions_from_kernel(kernel, targets, ridge_lambda=float(ridge))
+                candidates.append(
+                    {
+                        "ridge_lambda": float(ridge),
+                        "gamma_sample": None,
+                        "gamma_modality": None,
+                        "gamma_flat": gamma_flat,
+                        "modality_shared_weight": None,
+                        "linear_modality_weight": None,
+                        "loo_lds": spearmanr(loo_predictions, targets),
+                        "loo_rmse": rmse(loo_predictions, targets),
+                    }
+                )
+    elif method_name == "l2_laplacian_kernel":
+        flat_dist = pairwise_l2distance(
+            blocks.flat_deleted[train_indices],
+            blocks.flat_deleted[train_indices],
+        )
+        base_gamma_flat = median_heuristic_gamma(flat_dist)
+        for scale in gamma_scale_grid:
+            gamma_flat = float(base_gamma_flat * float(scale))
+            kernel = np.exp(-gamma_flat * flat_dist)
+            for ridge in ridge_grid:
+                loo_predictions = _loo_predictions_from_kernel(kernel, targets, ridge_lambda=float(ridge))
+                candidates.append(
+                    {
+                        "ridge_lambda": float(ridge),
+                        "gamma_sample": None,
+                        "gamma_modality": None,
+                        "gamma_flat": gamma_flat,
+                        "modality_shared_weight": None,
+                        "linear_modality_weight": None,
+                        "loo_lds": spearmanr(loo_predictions, targets),
+                        "loo_rmse": rmse(loo_predictions, targets),
+                    }
+                )
+    elif method_name == "second_order_polynomial_kernel":
+        flat = blocks.flat_deleted[train_indices]
+        dim = float(max(flat.shape[1], 1))
+        kernel = ((flat @ flat.T) / dim + 1.0) ** 2
+        for ridge in ridge_grid:
+            loo_predictions = _loo_predictions_from_kernel(kernel, targets, ridge_lambda=float(ridge))
+            candidates.append(
+                {
+                    "ridge_lambda": float(ridge),
+                    "gamma_sample": None,
+                    "gamma_modality": None,
+                    "gamma_flat": None,
+                    "modality_shared_weight": None,
+                    "linear_modality_weight": None,
+                    "loo_lds": spearmanr(loo_predictions, targets),
+                    "loo_rmse": rmse(loo_predictions, targets),
+                }
+            )
     elif method_name in {"kernel_surrogate_1_linear", "kernel_surrogate_2_linear"}:
         sample = blocks.sample_deleted[train_indices]
         modality = blocks.modality_deleted[train_indices]
         kernel = sample @ sample.T + modality @ modality.T
+        for ridge in ridge_grid:
+            loo_predictions = _loo_predictions_from_kernel(kernel, targets, ridge_lambda=float(ridge))
+            candidates.append(
+                {
+                    "ridge_lambda": float(ridge),
+                    "gamma_sample": None,
+                    "gamma_modality": None,
+                    "gamma_flat": None,
+                    "modality_shared_weight": None,
+                    "linear_modality_weight": None,
+                    "loo_lds": spearmanr(loo_predictions, targets),
+                    "loo_rmse": rmse(loo_predictions, targets),
+                }
+            )
+    elif method_name == "influence_function_linear":
+        flat = blocks.flat_deleted[train_indices]
+        kernel = flat @ flat.T
         for ridge in ridge_grid:
             loo_predictions = _loo_predictions_from_kernel(kernel, targets, ridge_lambda=float(ridge))
             candidates.append(
@@ -839,6 +924,97 @@ def search_kernel_hyperparams_validation(
                         "validation_rmse": rmse(validation_predictions, validation_targets),
                     }
                 )
+    elif method_name == "hamming_distance_kernel":
+        train_flat_dist = pairwise_hamming_distance(
+            blocks.flat_deleted[train_indices],
+            blocks.flat_deleted[train_indices],
+        )
+        validation_flat_dist = pairwise_hamming_distance(
+            blocks.flat_deleted[validation_indices],
+            blocks.flat_deleted[train_indices],
+        )
+        base_gamma_flat = median_heuristic_gamma(train_flat_dist)
+        for scale in gamma_scale_grid:
+            gamma_flat = float(base_gamma_flat * float(scale))
+            train_kernel = np.exp(-gamma_flat * train_flat_dist)
+            validation_kernel = np.exp(-gamma_flat * validation_flat_dist)
+            for ridge in ridge_grid:
+                validation_predictions = _query_predictions_from_kernel(
+                    train_kernel,
+                    validation_kernel,
+                    train_targets,
+                    ridge_lambda=float(ridge),
+                )
+                candidates.append(
+                    {
+                        "ridge_lambda": float(ridge),
+                        "gamma_sample": None,
+                        "gamma_modality": None,
+                        "gamma_flat": gamma_flat,
+                        "modality_shared_weight": None,
+                        "linear_modality_weight": None,
+                        "validation_lds": spearmanr(validation_predictions, validation_targets),
+                        "validation_rmse": rmse(validation_predictions, validation_targets),
+                    }
+                )
+    elif method_name == "l2_laplacian_kernel":
+        train_flat_dist = pairwise_l2distance(
+            blocks.flat_deleted[train_indices],
+            blocks.flat_deleted[train_indices],
+        )
+        validation_flat_dist = pairwise_l2distance(
+            blocks.flat_deleted[validation_indices],
+            blocks.flat_deleted[train_indices],
+        )
+        base_gamma_flat = median_heuristic_gamma(train_flat_dist)
+        for scale in gamma_scale_grid:
+            gamma_flat = float(base_gamma_flat * float(scale))
+            train_kernel = np.exp(-gamma_flat * train_flat_dist)
+            validation_kernel = np.exp(-gamma_flat * validation_flat_dist)
+            for ridge in ridge_grid:
+                validation_predictions = _query_predictions_from_kernel(
+                    train_kernel,
+                    validation_kernel,
+                    train_targets,
+                    ridge_lambda=float(ridge),
+                )
+                candidates.append(
+                    {
+                        "ridge_lambda": float(ridge),
+                        "gamma_sample": None,
+                        "gamma_modality": None,
+                        "gamma_flat": gamma_flat,
+                        "modality_shared_weight": None,
+                        "linear_modality_weight": None,
+                        "validation_lds": spearmanr(validation_predictions, validation_targets),
+                        "validation_rmse": rmse(validation_predictions, validation_targets),
+                    }
+                )
+    elif method_name == "second_order_polynomial_kernel":
+        train_flat = blocks.flat_deleted[train_indices]
+        validation_flat = blocks.flat_deleted[validation_indices]
+        dim = float(max(train_flat.shape[1], 1))
+        train_kernel = ((train_flat @ train_flat.T) / dim + 1.0) ** 2
+        validation_kernel = ((validation_flat @ train_flat.T) / dim + 1.0) ** 2
+        for ridge in ridge_grid:
+            validation_predictions = _query_predictions_from_kernel(
+                train_kernel,
+                validation_kernel,
+                train_targets,
+                ridge_lambda=float(ridge),
+            )
+            candidates.append(
+                {
+                    "ridge_lambda": float(ridge),
+                    "gamma_sample": None,
+                    "gamma_modality": None,
+                    "gamma_flat": None,
+                    "modality_shared_weight": None,
+                    "linear_modality_weight": None,
+                    "validation_lds": spearmanr(validation_predictions, validation_targets),
+                    "validation_rmse": rmse(validation_predictions, validation_targets),
+                }
+            )
     elif method_name in {"kernel_surrogate_1_linear", "kernel_surrogate_2_linear"}:
         train_sample = blocks.sample_deleted[train_indices]
         train_modality = blocks.modality_deleted[train_indices]
@@ -846,6 +1022,30 @@ def search_kernel_hyperparams_validation(
         validation_modality = blocks.modality_deleted[validation_indices]
         train_kernel = train_sample @ train_sample.T + train_modality @ train_modality.T
         validation_kernel = validation_sample @ train_sample.T + validation_modality @ train_modality.T
+        for ridge in ridge_grid:
+            validation_predictions = _query_predictions_from_kernel(
+                train_kernel,
+                validation_kernel,
+                train_targets,
+                ridge_lambda=float(ridge),
+            )
+            candidates.append(
+                {
+                    "ridge_lambda": float(ridge),
+                    "gamma_sample": None,
+                    "gamma_modality": None,
+                    "gamma_flat": None,
+                    "modality_shared_weight": None,
+                    "linear_modality_weight": None,
+                    "validation_lds": spearmanr(validation_predictions, validation_targets),
+                    "validation_rmse": rmse(validation_predictions, validation_targets),
+                }
+            )
+    elif method_name == "influence_function_linear":
+        train_flat = blocks.flat_deleted[train_indices]
+        validation_flat = blocks.flat_deleted[validation_indices]
+        train_kernel = train_flat @ train_flat.T
+        validation_kernel = validation_flat @ train_flat.T
         for ridge in ridge_grid:
             validation_predictions = _query_predictions_from_kernel(
                 train_kernel,
@@ -1084,12 +1284,45 @@ def compute_kernel(
         kernel = np.exp(-float(gamma_flat) * dist)
         return kernel, {"gamma_sample": None, "gamma_modality": None, "gamma_flat": float(gamma_flat)}
 
+    if method_name == "hamming_distance_kernel":
+        lhs = blocks.flat_deleted[lhs_indices]
+        rhs = blocks.flat_deleted[rhs_indices]
+        dist = pairwise_hamming_distance(lhs, rhs)
+        if gamma_flat is None:
+            gamma_flat = median_heuristic_gamma(pairwise_hamming_distance(blocks.flat_deleted[rhs_indices], blocks.flat_deleted[rhs_indices]))
+        kernel = np.exp(-float(gamma_flat) * dist)
+        return kernel, {"gamma_sample": None, "gamma_modality": None, "gamma_flat": float(gamma_flat)}
+
+    if method_name == "l2_laplacian_kernel":
+        lhs = blocks.flat_deleted[lhs_indices]
+        rhs = blocks.flat_deleted[rhs_indices]
+        dist = pairwise_l2distance(lhs, rhs)
+        if gamma_flat is None:
+            gamma_flat = median_heuristic_gamma(pairwise_l2distance(blocks.flat_deleted[rhs_indices], blocks.flat_deleted[rhs_indices]))
+        kernel = np.exp(-float(gamma_flat) * dist)
+        return kernel, {"gamma_sample": None, "gamma_modality": None, "gamma_flat": float(gamma_flat)}
+
+    if method_name == "second_order_polynomial_kernel":
+        lhs = blocks.flat_deleted[lhs_indices]
+        rhs = blocks.flat_deleted[rhs_indices]
+        dim = float(max(lhs.shape[1], 1))
+        kernel = ((lhs @ rhs.T) / dim + 1.0) ** 2
+        return kernel.astype(np.float64, copy=False), {"gamma_sample": None, "gamma_modality": None, "gamma_flat": None}
+
     if method_name in {"kernel_surrogate_1_linear", "kernel_surrogate_2_linear"}:
         lhs_sample = blocks.sample_deleted[lhs_indices]
         rhs_sample = blocks.sample_deleted[rhs_indices]
         lhs_modality = blocks.modality_deleted[lhs_indices]
         rhs_modality = blocks.modality_deleted[rhs_indices]
         kernel = lhs_sample @ rhs_sample.T + lhs_modality @ rhs_modality.T
+        return kernel.astype(np.float64, copy=False), {"gamma_sample": None, "gamma_modality": None, "gamma_flat": None}
+
+    if method_name == "influence_function_linear":
+        # First-order influence baseline: additive effects over flattened
+        # sample-modality deletion atoms with ridge regularization.
+        lhs_flat = blocks.flat_deleted[lhs_indices]
+        rhs_flat = blocks.flat_deleted[rhs_indices]
+        kernel = lhs_flat @ rhs_flat.T
         return kernel.astype(np.float64, copy=False), {"gamma_sample": None, "gamma_modality": None, "gamma_flat": None}
 
     if method_name in {"kernel_surrogate_hier_linear", "kernel_surrogate_hier_centered_linear"}:
@@ -1126,8 +1359,22 @@ def normalize_method_name(method: str) -> str:
         "hierarchical_rbf_v2": "kernel_surrogate_2_rbf",
         "flat_rbf": "raw_flat_rbf",
         "raw_rbf": "raw_flat_rbf",
+        "hamming": "hamming_distance_kernel",
+        "hamming_distance": "hamming_distance_kernel",
+        "hamming_kernel": "hamming_distance_kernel",
+        "laplacian_l2": "l2_laplacian_kernel",
+        "laplacian_l2_kernel": "l2_laplacian_kernel",
+        "l2_laplacian": "l2_laplacian_kernel",
+        "poly2": "second_order_polynomial_kernel",
+        "poly2_kernel": "second_order_polynomial_kernel",
+        "second_order_polynomial": "second_order_polynomial_kernel",
+        "second_order_polynomial_kernel": "second_order_polynomial_kernel",
         "ks1_linear": "kernel_surrogate_1_linear",
         "ks2_linear": "kernel_surrogate_2_linear",
+        "if": "influence_function_linear",
+        "if_linear": "influence_function_linear",
+        "influence": "influence_function_linear",
+        "influence_function": "influence_function_linear",
         "hlinear": "kernel_surrogate_hier_linear",
         "hier_linear": "kernel_surrogate_hier_linear",
         "hierarchical_linear": "kernel_surrogate_hier_linear",
@@ -1146,6 +1393,19 @@ def pairwise_sqeuclidean(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     rhs_sq = np.sum(rhs64 * rhs64, axis=1, keepdims=True).T
     dist = lhs_sq + rhs_sq - 2.0 * lhs64 @ rhs64.T
     return np.maximum(dist, 0.0)
+
+
+def pairwise_l2distance(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    return np.sqrt(pairwise_sqeuclidean(lhs, rhs))
+
+
+def pairwise_hamming_distance(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    lhs64 = np.asarray(lhs, dtype=np.float64)
+    rhs64 = np.asarray(rhs, dtype=np.float64)
+    # Equals classic Hamming distance for binary masks; for soft masks this is
+    # a bounded L1-style mismatch ratio in [0, 1].
+    diff = np.abs(lhs64[:, None, :] - rhs64[None, :, :])
+    return diff.mean(axis=2)
 
 
 def structured_modality_sqdistance(

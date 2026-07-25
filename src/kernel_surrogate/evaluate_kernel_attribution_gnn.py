@@ -397,6 +397,15 @@ def _run_self_tests() -> None:
     centered, _ = _kernel_for_self_test(blocks, "kernel_surrogate_hier_centered_linear")
     assert centered.shape == (4, 4)
     assert np.isfinite(centered).all()
+    hamming, _ = _kernel_for_self_test(blocks, "hamming_distance_kernel")
+    assert hamming.shape == (4, 4)
+    assert np.isfinite(hamming).all()
+    laplacian, _ = _kernel_for_self_test(blocks, "l2_laplacian_kernel")
+    assert laplacian.shape == (4, 4)
+    assert np.isfinite(laplacian).all()
+    poly2, _ = _kernel_for_self_test(blocks, "second_order_polynomial_kernel")
+    assert poly2.shape == (4, 4)
+    assert np.isfinite(poly2).all()
 
 
 def _format_optional_float(value: object) -> str:
