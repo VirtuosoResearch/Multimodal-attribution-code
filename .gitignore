@@ -9,3 +9,12 @@ results_*
 CLAUDE.md
 features/
 data/
+*.md
+checkpoints*
+*checkpoint*
+*results*
+old*
+results/
+data_*
+.vscode/
+moe/

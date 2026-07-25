@@ -1,8 +1,11 @@
 from .standard_dataloader import (
+    AVMNIST_ROOT,
     DATASETS_ROOT,
     FOOD101_ROOT,
     HUMOR_PATH,
     IMDB_PATH,
+    MOSEI_PATH,
+    MOSI_PATH,
     OXFORD_PET_ROOT,
     SARCAM_PATH,
     SARCASM_PATH,
@@ -14,10 +17,13 @@ from .standard_dataloader import (
 )
 
 __all__ = [
+    "AVMNIST_ROOT",
     "DATASETS_ROOT",
     "FOOD101_ROOT",
     "HUMOR_PATH",
     "IMDB_PATH",
+    "MOSEI_PATH",
+    "MOSI_PATH",
     "OXFORD_PET_ROOT",
     "SARCAM_PATH",
     "SARCASM_PATH",

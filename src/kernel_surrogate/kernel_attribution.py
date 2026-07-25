@@ -191,7 +191,27 @@ def build_mask_blocks(
                 raise ValueError(f"run {row}: group_ids must be 1D")
             if group_ids.size and (group_ids.min() < 0 or group_ids.max() >= dataset_size):
                 raise ValueError(f"run {row}: group id out of inferred range 0..{dataset_size - 1}")
-            sample_deleted[row, group_ids] = 0.0
+            # ``group_ids`` historically meant both "groups whose samples are
+            # present" and "groups whose modality masks are recorded".  Data
+            # acquisition experiments need to separate those concepts: all
+            # samples can remain present through a main modality while only a
+            # subset of groups receives auxiliary modalities.  New payloads
+            # therefore store every sample-present group in ``data_group_ids``
+            # and retain ``group_ids`` as the intervention/auxiliary groups.
+            # Falling back to ``group_ids`` keeps old subset-retraining results
+            # bit-for-bit compatible.
+            data_group_ids = np.asarray(
+                run.get("data_group_ids", group_ids), dtype=np.int64
+            )
+            if data_group_ids.ndim != 1:
+                raise ValueError(f"run {row}: data_group_ids must be 1D")
+            if data_group_ids.size and (
+                data_group_ids.min() < 0 or data_group_ids.max() >= dataset_size
+            ):
+                raise ValueError(
+                    f"run {row}: data group id out of inferred range 0..{dataset_size - 1}"
+                )
+            sample_deleted[row, data_group_ids] = 0.0
 
             local_groups = np.asarray(
                 [index_to_group.get(int(index), -1) for index in data_indices.tolist()],
@@ -199,7 +219,7 @@ def build_mask_blocks(
             )
             if np.any(local_groups < 0):
                 raise ValueError(f"run {row}: some data_indices are missing from group_partition")
-            for group_id in group_ids.tolist():
+            for group_id in data_group_ids.tolist():
                 group_mask = local_groups == int(group_id)
                 if not np.any(group_mask):
                     continue

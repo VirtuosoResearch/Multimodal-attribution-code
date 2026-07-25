@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-device", default=None)
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--search-split-seed", type=int, default=0)
+    parser.add_argument(
+        "--search-mode",
+        choices=["per_split", "fixed_hparams"],
+        default="per_split",
+        help="per_split grid-searches hparams independently for every split seed; fixed_hparams keeps the old search-seed-0 then fixed-hparams protocol.",
+    )
     parser.add_argument("--split-seeds", nargs="+", type=int, default=list(range(10)))
     parser.add_argument("--gradient-params", choices=["all", "last_layer"], default="last_layer")
     parser.add_argument("--metric-normalization", choices=["cosine", "diag_mean", "none"], default="cosine")
@@ -201,6 +207,52 @@ def evaluate_hparams(
         if key in fit:
             row[key] = float(fit[key])
     return row
+
+
+def best_for_split(
+    method: str,
+    *,
+    dataset: str,
+    loaded_settings: dict[str, tuple[dict[str, np.ndarray], np.ndarray]],
+    metric: np.ndarray,
+    syn_metric: np.ndarray,
+    train_fraction: float,
+    split_seed: int,
+    ridge_grid: Sequence[float],
+    gamma_grid: Sequence[float],
+    shared_grid: Sequence[float],
+    syn_gamma_grid: Sequence[float],
+    lambda_syn_grid: Sequence[float],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    best: dict[str, Any] | None = None
+    rows: list[dict[str, Any]] = []
+    for setting, (mask_blocks, targets) in loaded_settings.items():
+        for hparams in iter_hparams(
+            method,
+            ridge_grid=ridge_grid,
+            gamma_grid=gamma_grid,
+            shared_grid=shared_grid,
+            syn_gamma_grid=syn_gamma_grid,
+            lambda_syn_grid=lambda_syn_grid,
+        ):
+            row = evaluate_hparams(
+                method,
+                dataset=dataset,
+                setting=setting,
+                mask_blocks=mask_blocks,
+                targets=targets,
+                metric=metric,
+                syn_metric=syn_metric,
+                hparams=hparams,
+                train_fraction=train_fraction,
+                split_seed=split_seed,
+            )
+            rows.append(row)
+            if best is None or score_key(row) > score_key(best):
+                best = row
+    if best is None:
+        raise ValueError(f"empty grid for method={method}")
+    return best, rows
 
 
 def iter_hparams(
@@ -331,9 +383,9 @@ def main() -> None:
     if unknown_settings:
         raise ValueError(f"unknown settings: {unknown_settings}; expected one of {sorted(SETTING_TO_RUN)}")
 
-    ridge_grid = parse_float_list(args.ridge_grid, (1e-8, 1e-6, 1e-4, 1e-2, 1.0, 100.0))
+    ridge_grid = parse_float_list(args.ridge_grid, (1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0))
     gamma_grid = parse_float_list(args.gamma_grid, (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0))
-    shared_grid = parse_float_list(args.shared_grid, (0.0, 0.5, 1.0, 2.0, 5.0))
+    shared_grid = parse_float_list(args.shared_grid, (0.0, 0.1, 0.5, 1.0, 2.0, 5.0))
     syn_gamma_grid = parse_float_list(args.syn_gamma_grid, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
     lambda_syn_grid = parse_float_list(args.lambda_syn_grid, (0.1, 1.0, 10.0))
     split_seeds = [int(seed) for seed in args.split_seeds]
@@ -368,6 +420,33 @@ def main() -> None:
             loaded_settings[setting] = build_group_mask_blocks(payload)
 
         for method in [str(item) for item in args.methods]:
+            if args.search_mode == "per_split":
+                for split_seed in split_seeds:
+                    best, rows = best_for_split(
+                        method,
+                        dataset=dataset,
+                        loaded_settings=loaded_settings,
+                        metric=metric,
+                        syn_metric=syn_metric,
+                        train_fraction=float(args.train_fraction),
+                        split_seed=int(split_seed),
+                        ridge_grid=ridge_grid,
+                        gamma_grid=gamma_grid,
+                        shared_grid=shared_grid,
+                        syn_gamma_grid=syn_gamma_grid,
+                        lambda_syn_grid=lambda_syn_grid,
+                    )
+                    search_records.extend(rows)
+                    fixed_eval_records.append(best)
+                    best_hparams.append(best)
+                    print(
+                        f"[{dataset}] per-split best {method} split_seed={split_seed}: "
+                        f"setting={best['setting']} LDS={best['test_lds']:.6f} "
+                        f"Pearson={best['test_pearson']:.6f} RMSE={best['test_rmse']:.6f}",
+                        flush=True,
+                    )
+                continue
+
             best: dict[str, Any] | None = None
             for setting, (mask_blocks, targets) in loaded_settings.items():
                 for hparams in iter_hparams(
@@ -450,6 +529,7 @@ def main() -> None:
             "settings": settings,
             "methods": [str(item) for item in args.methods],
             "split": f"{float(args.train_fraction):.6g}/{1.0 - float(args.train_fraction):.6g}",
+            "search_mode": str(args.search_mode),
             "search_split_seed": int(args.search_split_seed),
             "split_seeds": split_seeds,
             "ridge_grid": list(ridge_grid),
@@ -493,8 +573,9 @@ def to_markdown(payload: dict[str, Any]) -> str:
         "# PID-FIC KMeans Kernel Surrogate",
         "",
         f"- split: `{payload['config']['split']}`",
+        f"- search mode: `{payload['config'].get('search_mode', 'fixed_hparams')}`",
         f"- search split seed: `{payload['config']['search_split_seed']}`",
-        f"- fixed-eval split seeds: `{payload['config']['split_seeds']}`",
+        f"- split seeds: `{payload['config']['split_seeds']}`",
         f"- top-k per dataset/method: `{payload['config']['top_k']}`",
         f"- gradient params: `{payload['config']['gradient_params']}`",
         "",

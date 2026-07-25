@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
+import torch
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -23,7 +24,9 @@ if str(ROOT) not in sys.path:
 from fisher_geometry.data import load_dataset
 from kernel_surrogate.fisher_enhanced_rbf import (
     fisher_corrected_score_grams,
+    fisher_structured_distance_parts,
     fit_fisher_enhanced_rbf,
+    hierarchical_availability,
     pearsonr,
     predict_fisher_enhanced_rbf,
 )
@@ -35,6 +38,7 @@ from kernel_surrogate.real_data_cmis import (
     fit_surrogate_method,
     load_or_train_full_model,
     make_model_args,
+    median_gamma,
     predict_surrogate_method,
     resolve_device,
     resolve_full_checkpoint_path,
@@ -83,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-device", default=None)
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--search-split-seed", type=int, default=0)
+    parser.add_argument(
+        "--search-mode",
+        choices=["per_split", "fixed_hparams"],
+        default="per_split",
+        help="per_split grid-searches hparams independently for every split seed; fixed_hparams keeps the old search-seed-0 then fixed-hparams protocol.",
+    )
     parser.add_argument("--split-seeds", nargs="+", type=int, default=list(range(10)))
     parser.add_argument("--gradient-params", choices=["all", "last_layer"], default="last_layer")
     parser.add_argument("--metric-normalization", choices=["cosine", "diag_mean", "none"], default="cosine")
@@ -259,6 +269,182 @@ def evaluate_hparams(
     return row
 
 
+def best_for_split(
+    method: str,
+    *,
+    dataset: str,
+    loaded_settings: dict[str, tuple[dict[str, np.ndarray], np.ndarray]],
+    metric: np.ndarray,
+    fisher_metrics: dict[tuple[float, float], tuple[np.ndarray, np.ndarray, dict[str, Any]]],
+    train_fraction: float,
+    split_seed: int,
+    ridge_grid: Sequence[float],
+    gamma_grid: Sequence[float],
+    gamma_a_grid: Sequence[float],
+    gamma_e_grid: Sequence[float],
+    shared_grid: Sequence[float],
+    beta_grid: Sequence[float],
+    fisher_lambda_grid: Sequence[float],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if method == "fisher_enhanced_rbf":
+        return best_fisher_enhanced_for_split(
+            dataset=dataset,
+            loaded_settings=loaded_settings,
+            fisher_metrics=fisher_metrics,
+            train_fraction=train_fraction,
+            split_seed=split_seed,
+            ridge_grid=ridge_grid,
+            gamma_a_grid=gamma_a_grid,
+            gamma_e_grid=gamma_e_grid,
+            beta_grid=beta_grid,
+            fisher_lambda_grid=fisher_lambda_grid,
+        )
+
+    best: dict[str, Any] | None = None
+    rows: list[dict[str, Any]] = []
+    for setting, (mask_blocks, targets) in loaded_settings.items():
+        for hparams in iter_hparams(
+            method,
+            ridge_grid=ridge_grid,
+            gamma_grid=gamma_grid,
+            gamma_a_grid=gamma_a_grid,
+            gamma_e_grid=gamma_e_grid,
+            shared_grid=shared_grid,
+            beta_grid=beta_grid,
+            fisher_lambda_grid=fisher_lambda_grid,
+        ):
+            row = evaluate_hparams(
+                method,
+                dataset=dataset,
+                setting=setting,
+                mask_blocks=mask_blocks,
+                targets=targets,
+                metric=metric,
+                fisher_metrics=fisher_metrics,
+                hparams=hparams,
+                train_fraction=train_fraction,
+                split_seed=split_seed,
+            )
+            rows.append(row)
+            if best is None or score_key(row) > score_key(best):
+                best = row
+    if best is None:
+        raise ValueError(f"empty grid for method={method}")
+    return best, rows
+
+
+def best_fisher_enhanced_for_split(
+    *,
+    dataset: str,
+    loaded_settings: dict[str, tuple[dict[str, np.ndarray], np.ndarray]],
+    fisher_metrics: dict[tuple[float, float], tuple[np.ndarray, np.ndarray, dict[str, Any]]],
+    train_fraction: float,
+    split_seed: int,
+    ridge_grid: Sequence[float],
+    gamma_a_grid: Sequence[float],
+    gamma_e_grid: Sequence[float],
+    beta_grid: Sequence[float],
+    fisher_lambda_grid: Sequence[float],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    best: dict[str, Any] | None = None
+    rows: list[dict[str, Any]] = []
+    search_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if search_device.type != "cuda":
+        print("CUDA unavailable for Fisher-enhanced grid search; falling back to CPU tensors.", flush=True)
+    for setting, (mask_blocks, targets) in loaded_settings.items():
+        train_indices, test_indices = split_indices(len(targets), train_fraction=train_fraction, seed=split_seed)
+        y_train = targets[train_indices]
+        truth = targets[test_indices]
+        target_mean = float(np.mean(y_train))
+        centered_y = y_train - target_mean
+        train_sample, train_modality = hierarchical_availability(mask_blocks, train_indices)
+        test_sample, test_modality = hierarchical_availability(mask_blocks, test_indices)
+        for beta in beta_grid:
+            lambda_values = (1.0,) if float(beta) == 0.0 else fisher_lambda_grid
+            for fisher_lambda in lambda_values:
+                sample_metric, modality_metric, gram_stats = fisher_metrics[(float(beta), float(fisher_lambda))]
+                train_sample_dist, train_modality_dist = fisher_structured_distance_parts(
+                    train_sample,
+                    train_modality,
+                    train_sample,
+                    train_modality,
+                    sample_metric=sample_metric,
+                    modality_metric=modality_metric,
+                )
+                test_sample_dist, test_modality_dist = fisher_structured_distance_parts(
+                    test_sample,
+                    test_modality,
+                    train_sample,
+                    train_modality,
+                    sample_metric=sample_metric,
+                    modality_metric=modality_metric,
+                )
+                base_gamma_a = median_gamma(train_sample_dist)
+                base_gamma_e = median_gamma(train_modality_dist)
+                train_sample_dist_t = torch.as_tensor(train_sample_dist, dtype=torch.float64, device=search_device)
+                train_modality_dist_t = torch.as_tensor(train_modality_dist, dtype=torch.float64, device=search_device)
+                test_sample_dist_t = torch.as_tensor(test_sample_dist, dtype=torch.float64, device=search_device)
+                test_modality_dist_t = torch.as_tensor(test_modality_dist, dtype=torch.float64, device=search_device)
+                centered_y_t = torch.as_tensor(centered_y, dtype=torch.float64, device=search_device)
+                for gamma_a_scale in gamma_a_grid:
+                    gamma_a = float(base_gamma_a * float(gamma_a_scale))
+                    train_sample_term = gamma_a * train_sample_dist_t
+                    test_sample_term = gamma_a * test_sample_dist_t
+                    for gamma_e_scale in gamma_e_grid:
+                        gamma_e = float(base_gamma_e * float(gamma_e_scale))
+                        kernel_t = torch.exp(-(train_sample_term + gamma_e * train_modality_dist_t))
+                        kernel_t = 0.5 * (kernel_t + kernel_t.T)
+                        test_kernel_t = torch.exp(-(test_sample_term + gamma_e * test_modality_dist_t))
+                        eye_t = torch.eye(kernel_t.shape[0], dtype=kernel_t.dtype, device=kernel_t.device)
+                        try:
+                            eigvals, eigvecs = torch.linalg.eigh(kernel_t + 1e-10 * eye_t)
+                            projected_y = eigvecs.T @ centered_y_t
+                            use_eigh = True
+                        except torch._C._LinAlgError:
+                            eigvals = eigvecs = projected_y = None
+                            use_eigh = False
+                        for ridge in ridge_grid:
+                            if use_eigh:
+                                alpha = eigvecs @ (projected_y / (eigvals + float(ridge)))
+                            else:
+                                alpha = torch.linalg.solve(kernel_t + float(ridge) * eye_t, centered_y_t)
+                            pred = (target_mean + test_kernel_t @ alpha).detach().cpu().numpy()
+                            train_pred = (target_mean + kernel_t @ alpha).detach().cpu().numpy()
+                            row = {
+                                "dataset": dataset,
+                                "setting": setting,
+                                "run_name": SETTING_TO_RUN[setting],
+                                "method": "fisher_enhanced_rbf",
+                                "ridge_lambda": float(ridge),
+                                "gamma_scale": None,
+                                "gamma_a_scale": float(gamma_a_scale),
+                                "gamma_e_scale": float(gamma_e_scale),
+                                "structured_shared_weight": None,
+                                "beta": float(beta),
+                                "fisher_lambda": float(fisher_lambda),
+                                "split_seed": int(split_seed),
+                                "test_lds": spearmanr(pred, truth),
+                                "test_pearson": pearsonr(pred, truth),
+                                "test_rmse": rmse(pred, truth),
+                                "train_lds": spearmanr(train_pred, y_train),
+                                "train_rmse": rmse(train_pred, y_train),
+                                "num_train": int(train_indices.size),
+                                "num_test": int(test_indices.size),
+                                "num_subsets": int(len(targets)),
+                                "gamma_a": gamma_a,
+                                "gamma_e": gamma_e,
+                                "base_gamma_a": float(base_gamma_a),
+                                "base_gamma_e": float(base_gamma_e),
+                                "gram_stats": gram_stats,
+                            }
+                            rows.append(row)
+                            if best is None or score_key(row) > score_key(best):
+                                best = row
+    if best is None:
+        raise ValueError("empty fisher_enhanced_rbf grid")
+    return best, rows
+
+
 def load_or_compute_unimodal_gradients(
     *,
     dataset: str,
@@ -363,11 +549,11 @@ def main() -> None:
     if unknown_settings:
         raise ValueError(f"unknown settings: {unknown_settings}; expected one of {sorted(SETTING_TO_RUN)}")
 
-    ridge_grid = parse_float_list(args.ridge_grid, (1e-8, 1e-6, 1e-4, 1e-2, 1.0, 100.0))
+    ridge_grid = parse_float_list(args.ridge_grid, (1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0))
     gamma_grid = parse_float_list(args.gamma_grid, (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0))
     gamma_a_grid = parse_float_list(args.gamma_a_grid, gamma_grid)
     gamma_e_grid = parse_float_list(args.gamma_e_grid, gamma_grid)
-    shared_grid = parse_float_list(args.shared_grid, (0.0, 0.5, 1.0, 2.0, 5.0))
+    shared_grid = parse_float_list(args.shared_grid, (0.0, 0.1, 0.5, 1.0, 2.0, 5.0))
     beta_grid = parse_float_list(args.beta_grid, (0.0, 0.25, 0.5, 0.75, 1.0))
     fisher_lambda_grid = parse_float_list(args.fisher_lambda_grid, (1e-3, 1e-2, 1e-1, 1.0))
     split_seeds = [int(seed) for seed in args.split_seeds]
@@ -402,6 +588,35 @@ def main() -> None:
             loaded_settings[setting] = build_group_mask_blocks(payload)
 
         for method in [str(item) for item in args.methods]:
+            if args.search_mode == "per_split":
+                for split_seed in split_seeds:
+                    best, rows = best_for_split(
+                        method,
+                        dataset=dataset,
+                        loaded_settings=loaded_settings,
+                        metric=metric,
+                        fisher_metrics=fisher_metrics,
+                        train_fraction=float(args.train_fraction),
+                        split_seed=int(split_seed),
+                        ridge_grid=ridge_grid,
+                        gamma_grid=gamma_grid,
+                        gamma_a_grid=gamma_a_grid,
+                        gamma_e_grid=gamma_e_grid,
+                        shared_grid=shared_grid,
+                        beta_grid=beta_grid,
+                        fisher_lambda_grid=fisher_lambda_grid,
+                    )
+                    search_records.extend(rows)
+                    fixed_eval_records.append(best)
+                    best_hparams.append(best)
+                    print(
+                        f"[{dataset}] per-split best {method} split_seed={split_seed}: "
+                        f"setting={best['setting']} LDS={best['test_lds']:.6f} "
+                        f"Pearson={best['test_pearson']:.6f} RMSE={best['test_rmse']:.6f}",
+                        flush=True,
+                    )
+                continue
+
             best: dict[str, Any] | None = None
             for setting, (mask_blocks, targets) in loaded_settings.items():
                 for hparams in iter_hparams(
@@ -488,6 +703,7 @@ def main() -> None:
             "settings": settings,
             "methods": [str(item) for item in args.methods],
             "split": f"{float(args.train_fraction):.6g}/{1.0 - float(args.train_fraction):.6g}",
+            "search_mode": str(args.search_mode),
             "search_split_seed": int(args.search_split_seed),
             "split_seeds": split_seeds,
             "ridge_grid": list(ridge_grid),
@@ -532,8 +748,9 @@ def to_markdown(payload: dict[str, Any]) -> str:
         "# Fisher-Enhanced RBF KMeans Kernel Surrogate",
         "",
         f"- split: `{payload['config']['split']}`",
+        f"- search mode: `{payload['config'].get('search_mode', 'fixed_hparams')}`",
         f"- search split seed: `{payload['config']['search_split_seed']}`",
-        f"- fixed-eval split seeds: `{payload['config']['split_seeds']}`",
+        f"- split seeds: `{payload['config']['split_seeds']}`",
         f"- top-k per dataset/method: `{payload['config']['top_k']}`",
         f"- gradient params: `{payload['config']['gradient_params']}`",
         "",

@@ -25,6 +25,7 @@ from fisher_geometry.experiment import build_model
 from fisher_geometry.fisher_metrics import compute_loss
 from kernel_surrogate.kernel_attribution import rmse, spearmanr
 from kernel_surrogate.lds_real_train import _evaluate_classifier, _train_model
+from kernel_surrogate.sks import sks_masks_and_metric, sks_metric as sks_metric
 
 
 DEFAULT_RESULT_DIR = (
@@ -71,8 +72,15 @@ def main() -> None:
     parser.add_argument(
         "--kernel-methods",
         nargs="+",
-        default=["metric_rbf", "structured_metric_rbf", "structured_rbf", "raw_flat_rbf"],
-        choices=["metric_rbf", "structured_metric_rbf", "structured_rbf", "raw_flat_rbf", "linear_regression"],
+        default=["metric_rbf", "structured_metric_rbf", "structured_rbf", "sks", "raw_flat_rbf"],
+        choices=[
+            "metric_rbf",
+            "structured_metric_rbf",
+            "structured_rbf",
+            "sks",
+            "raw_flat_rbf",
+            "linear_regression",
+        ],
     )
     parser.add_argument("--gradient-params", choices=["all", "last_layer"], default="last_layer")
     parser.add_argument("--structured-shared-weight", type=float, default=1.0)
@@ -688,7 +696,7 @@ def fit_surrogate_method(
         "train_masks": train_masks.copy(),
         "metric": train_metric.copy(),
         "atom_offset": int(mask_blocks["sample_deleted"].shape[1])
-        if method in {"structured_rbf", "structured_metric_rbf"}
+        if method in {"structured_rbf", "structured_metric_rbf", "sks"}
         else 0,
     }
 
@@ -743,6 +751,12 @@ def method_masks_and_metric(
             shared_weight=structured_shared_weight,
         )
         return flat, struct_metric
+    if method == "sks":
+        return sks_masks_and_metric(
+            mask_blocks,
+            train_indices=train_indices,
+            rho=structured_shared_weight,
+        )
     if method == "structured_metric_rbf":
         sample = mask_blocks["sample_deleted"][train_indices]
         modality = mask_blocks["modality_deleted"][train_indices]

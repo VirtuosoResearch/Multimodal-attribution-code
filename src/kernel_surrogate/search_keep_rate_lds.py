@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -32,18 +33,40 @@ from kernel_surrogate.real_data_cmis import (
 from fisher_geometry.data import load_dataset
 
 
-DATASETS = ("imdb", "mosei", "mosi", "sarcasm")
+DATASETS = ("avmnist", "imdb", "humor", "mosei", "mosi", "sarcasm")
 SETTINGS = (
     ("kmeans_data80_mod80", "kmeans_grouped25_subset100_data80_mod80"),
     ("kmeans_data90_mod90", "kmeans_grouped25_subset100_data90_mod90"),
 )
-METHODS = ("metric_rbf", "structured_metric_rbf", "structured_rbf", "raw_flat_rbf", "linear_regression")
+METHODS = (
+    "metric_rbf",
+    "structured_metric_rbf",
+    "structured_rbf",
+    "sks",
+    "raw_flat_rbf",
+    "linear_regression",
+)
 RIDGE_GRID = (1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0)
 GAMMA_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0)
 SHARED_GRID = (0.0, 0.1, 0.5, 1.0, 2.0, 5.0)
+RHO_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 0.95)
 
 OUTPUT_JSON = ROOT / "src" / "kernel_surrogate" / "results" / "search_keep_rate_lds_80_20.json"
 OUTPUT_MD = ROOT / "src" / "kernel_surrogate" / "results" / "search_keep_rate_lds_80_20.md"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Grid-search kernel surrogate LDS on existing subset-result JSON files.")
+    parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
+    parser.add_argument("--settings", nargs="+", default=[name for name, _ in SETTINGS])
+    parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--train-fraction", type=float, default=0.8)
+    parser.add_argument("--split-seed", type=int, default=0)
+    parser.add_argument("--output-json", type=Path, default=OUTPUT_JSON)
+    parser.add_argument("--output-md", type=Path, default=OUTPUT_MD)
+    return parser.parse_args()
 
 
 def pearson_spearman(pred: np.ndarray, truth: np.ndarray) -> tuple[float, float]:
@@ -75,7 +98,11 @@ def load_payload(path: Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    device = resolve_device("cuda:0")
+    args = parse_args()
+    device = resolve_device(str(args.device))
+    selected_settings = {str(item) for item in args.settings}
+    selected_methods = tuple(str(item) for item in args.methods)
+    needs_metric = any(method in {"metric_rbf", "structured_metric_rbf"} for method in selected_methods)
     results: list[dict[str, Any]] = []
     per_dataset_best: list[dict[str, Any]] = []
 
@@ -83,67 +110,84 @@ def main() -> None:
     grouped_full_root = ROOT / "src" / "kernel_surrogate" / "subset_checkpoints" / "lds_real_train" / "grouped25_full_data_train"
     full_fallback = ROOT / "src" / "kernel_surrogate" / "full_checkpoints" / "real_data_cmis"
 
-    for dataset in DATASETS:
+    for dataset in [str(item) for item in args.datasets]:
         dataset_rows: list[dict[str, Any]] = []
         for setting_name, run_name in SETTINGS:
+            if setting_name not in selected_settings:
+                continue
             result_dir = ROOT / "src" / "kernel_surrogate" / "subset_results" / "lds_real_train" / run_name
-            payload = load_payload(result_dir / f"{dataset}_seed0.json")
+            payload_path = result_dir / f"{dataset}_seed{int(args.seed)}.json"
+            if not payload_path.exists():
+                continue
+            payload = load_payload(payload_path)
             config = dict(payload["config"])
-
-            data = load_dataset(
-                dataset,
-                0,
-                text_backbone=str(config.get("text_backbone", "clip_cached")),
-                vision_backbone=str(config.get("vision_backbone", "clip_cached")),
-                feature_device=str(config.get("feature_device", device)),
-                backbone_batch_size=int(config.get("backbone_batch_size", 32)),
-                download_datasets=bool(config.get("download_datasets", False)),
-                backbone_cache_dir=config.get("backbone_cache_dir"),
-            )
-            model_args = make_model_args(config, device=str(device))
-            preferred_root = kmeans_full_root
-            preferred_ckpt = preferred_root / dataset / "seed0" / "subset001" / "checkpoints" / "checkpoint_repeat01.pt"
-            if not preferred_ckpt.exists():
-                preferred_root = grouped_full_root
-            full_checkpoint = resolve_full_checkpoint_path(
-                dataset=dataset,
-                seed=0,
-                pretrained_root=preferred_root,
-                fallback_dir=full_fallback,
-            )
-            model, full_metrics = load_or_train_full_model(
-                full_checkpoint,
-                data=data,
-                task=str(data["task"]),
-                dim_x=int(data["train_x"].shape[1]),
-                dim_y=int(data["train_y"].shape[1]),
-                num_classes=int(data["num_classes"]),
-                model_args=model_args,
-                model_type=str(config.get("model", "cross_attention")),
-                seed=0,
-                force_train=False,
-            )
-            model.to(device)
-            model.eval()
-            gradients = compute_group_modality_gradients(
-                model,
-                data=data,
-                group_indices=payload["group_partition"]["group_indices"],
-                task=str(data["task"]),
-                device=str(device),
-                gradient_params="last_layer",
-            )
-            metric, _ = build_metric(gradients, normalization="cosine")
             mask_blocks, targets = build_group_mask_blocks(payload)
-            train_indices, test_indices = split_indices(len(targets), train_fraction=0.8, seed=0)
+            if needs_metric:
+                data = load_dataset(
+                    dataset,
+                    int(args.seed),
+                    text_backbone=str(config.get("text_backbone", "clip_cached")),
+                    vision_backbone=str(config.get("vision_backbone", "clip_cached")),
+                    feature_device=str(config.get("feature_device", device)),
+                    backbone_batch_size=int(config.get("backbone_batch_size", 32)),
+                    download_datasets=bool(config.get("download_datasets", False)),
+                    backbone_cache_dir=config.get("backbone_cache_dir"),
+                )
+                model_args = make_model_args(config, device=str(device))
+                preferred_root = kmeans_full_root
+                preferred_ckpt = preferred_root / dataset / "seed0" / "subset001" / "checkpoints" / "checkpoint_repeat01.pt"
+                if not preferred_ckpt.exists():
+                    preferred_root = grouped_full_root
+                full_checkpoint = resolve_full_checkpoint_path(
+                    dataset=dataset,
+                    seed=int(args.seed),
+                    pretrained_root=preferred_root,
+                    fallback_dir=full_fallback,
+                )
+                model, full_metrics = load_or_train_full_model(
+                    full_checkpoint,
+                    data=data,
+                    task=str(data["task"]),
+                    dim_x=int(data["train_x"].shape[1]),
+                    dim_y=int(data["train_y"].shape[1]),
+                    num_classes=int(data["num_classes"]),
+                    model_args=model_args,
+                    model_type=str(config.get("model", "cross_attention")),
+                    seed=int(args.seed),
+                    force_train=False,
+                )
+                model.to(device)
+                model.eval()
+                gradients = compute_group_modality_gradients(
+                    model,
+                    data=data,
+                    group_indices=payload["group_partition"]["group_indices"],
+                    task=str(data["task"]),
+                    device=str(device),
+                    gradient_params="last_layer",
+                )
+                metric, _ = build_metric(gradients, normalization="cosine")
+            else:
+                metric = np.eye(mask_blocks["flat_deleted"].shape[1], dtype=np.float64)
+                full_metrics = {"loss": float("nan"), "acc": float("nan")}
+            train_indices, test_indices = split_indices(
+                len(targets),
+                train_fraction=float(args.train_fraction),
+                seed=int(args.split_seed),
+            )
             truth = targets[test_indices]
 
             best_rows: list[dict[str, Any]] = []
-            for method in METHODS:
+            for method in selected_methods:
                 best: dict[str, Any] | None = None
                 method_metric = metric if method != "linear_regression" else np.eye(mask_blocks["flat_deleted"].shape[1], dtype=np.float64)
                 gamma_values = (None,) if method == "linear_regression" else GAMMA_GRID
-                shared_values = SHARED_GRID if method in {"structured_metric_rbf", "structured_rbf"} else (None,)
+                if method in {"structured_metric_rbf", "structured_rbf"}:
+                    shared_values = SHARED_GRID
+                elif method == "sks":
+                    shared_values = RHO_GRID
+                else:
+                    shared_values = (None,)
 
                 for ridge in RIDGE_GRID:
                     for gamma in gamma_values:
@@ -205,25 +249,27 @@ def main() -> None:
 
     payload = {
         "config": {
-            "datasets": list(DATASETS),
-            "settings": [name for name, _ in SETTINGS],
-            "split": "80/20 seed0",
+            "datasets": [str(item) for item in args.datasets],
+            "settings": [name for name, _ in SETTINGS if name in selected_settings],
+            "methods": list(selected_methods),
+            "split": f"{float(args.train_fraction):.6g}/{1.0 - float(args.train_fraction):.6g} seed{int(args.split_seed)}",
             "metric_normalization": "cosine",
             "gradient_params": "last_layer",
             "ridge_grid": list(RIDGE_GRID),
             "gamma_grid": list(GAMMA_GRID),
             "shared_grid": list(SHARED_GRID),
+            "rho_grid": list(RHO_GRID),
         },
         "records": results,
         "per_dataset_best_setting": per_dataset_best,
     }
-    OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_MD.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_JSON.write_text(json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8")
-    OUTPUT_MD.write_text(to_markdown(payload), encoding="utf-8")
+    args.output_json.parent.mkdir(parents=True, exist_ok=True)
+    args.output_md.parent.mkdir(parents=True, exist_ok=True)
+    args.output_json.write_text(json.dumps(payload, indent=2, allow_nan=True), encoding="utf-8")
+    args.output_md.write_text(to_markdown(payload), encoding="utf-8")
     print(to_markdown(payload), flush=True)
-    print(f"Saved JSON to {OUTPUT_JSON}", flush=True)
-    print(f"Saved Markdown to {OUTPUT_MD}", flush=True)
+    print(f"Saved JSON to {args.output_json}", flush=True)
+    print(f"Saved Markdown to {args.output_md}", flush=True)
 
 
 def to_markdown(payload: dict[str, Any]) -> str:

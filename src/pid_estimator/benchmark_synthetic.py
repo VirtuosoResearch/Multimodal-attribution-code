@@ -11,7 +11,16 @@ import torch
 from pid_estimator.ce_alignment import CEAlignmentConfig, estimate_pid_with_ce_alignment
 from pid_estimator.data import MultimodalDataset
 from pid_estimator.direct_kernel import DirectKernelPIDConfig, estimate_direct_kernel_pid
+from pid_estimator.kernelized_completion import (
+    KernelizedCompletionPIDConfig,
+    estimate_discrete_bertschinger_pid,
+    estimate_kernelized_completion_pid,
+)
 from pid_estimator.lsmi import LSMIConfig, estimate_lsmi
+from pid_estimator.non_interactive_completion import (
+    NonInteractiveCompletionConfig,
+    estimate_non_interactive_completion_pid,
+)
 from pid_estimator.surrogate import SurrogatePIDConfig, estimate_surrogate_pid
 from pid_estimator.synthetic_data import (
     SyntheticGenerationConfig,
@@ -57,6 +66,28 @@ def main() -> None:
     parser.add_argument("--direct-kernel-lambda-redundancy", type=float, default=2.5)
     parser.add_argument("--direct-kernel-lambda-interval", type=float, default=0.0)
     parser.add_argument("--direct-kernel-lambda-rkhs", type=float, default=0.0)
+    parser.add_argument("--kernelized-completion-reference-estimator", type=str, default="auto")
+    parser.add_argument("--kernelized-completion-gamma", type=float, default=None)
+    parser.add_argument("--kernelized-completion-ridge-lambda", type=float, default=1e-2)
+    parser.add_argument("--kernelized-completion-epochs", type=int, default=200)
+    parser.add_argument("--kernelized-completion-lr", type=float, default=5e-2)
+    parser.add_argument("--kernelized-completion-lambda-completion", type=float, default=1.0)
+    parser.add_argument("--kernelized-completion-lambda-components", type=float, default=1.0)
+    parser.add_argument("--kernelized-completion-lambda-min", type=float, default=0.1)
+    parser.add_argument("--kernelized-completion-lambda-rkhs", type=float, default=1e-3)
+    parser.add_argument("--non-interactive-hidden-dim", type=int, default=64)
+    parser.add_argument("--non-interactive-additive-hidden-dim", type=int, default=64)
+    parser.add_argument("--non-interactive-predictor-model", type=str, default="mlp")
+    parser.add_argument("--non-interactive-additive-model", type=str, default="mlp")
+    parser.add_argument("--non-interactive-predictor-epochs", type=int, default=10)
+    parser.add_argument("--non-interactive-additive-epochs", type=int, default=10)
+    parser.add_argument("--non-interactive-predictor-lr", type=float, default=1e-3)
+    parser.add_argument("--non-interactive-additive-lr", type=float, default=1e-3)
+    parser.add_argument("--non-interactive-kernel-gamma", type=float, default=None)
+    parser.add_argument("--non-interactive-kernel-ridge-lambda", type=float, default=1e-2)
+    parser.add_argument("--non-interactive-additive-feasibility-lambda", type=float, default=0.0)
+    parser.add_argument("--non-interactive-additive-rkhs-lambda", type=float, default=0.0)
+    parser.add_argument("--non-interactive-additive-anchor-lambda", type=float, default=1.0)
     parser.add_argument(
         "--lsmi-cache-json",
         type=str,
@@ -166,6 +197,7 @@ def main() -> None:
             {
                 "case": case,
                 "repeat": args.logic_repeat,
+                "analytic_reference": _analytic_logic_reference(x1_test, x2_test, y_test),
                 "train_shape": {
                     "x1": list(x1_train.shape),
                     "x2": list(x2_train.shape),
@@ -352,6 +384,60 @@ def _run_estimators(
         ),
         device=device,
     )
+    kernelized_completion_result = estimate_kernelized_completion_pid(
+        x1_train,
+        x2_train,
+        y_train,
+        num_labels=num_labels,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        config=KernelizedCompletionPIDConfig(
+            batch_size=args.surrogate_batch_size,
+            predictor_epochs=args.surrogate_predictor_epochs,
+            calibration_blocks=args.surrogate_calibration_blocks,
+            calibration_subsets=args.surrogate_calibration_subsets,
+            reference_estimator=args.kernelized_completion_reference_estimator,
+            reference_lsmi_discriminator_epochs=args.surrogate_reference_lsmi_discriminator_epochs,
+            reference_lsmi_entropy_epochs=args.surrogate_reference_lsmi_entropy_epochs,
+            kernel_gamma=args.kernelized_completion_gamma,
+            ridge_lambda=args.kernelized_completion_ridge_lambda,
+            completion_epochs=args.kernelized_completion_epochs,
+            completion_lr=args.kernelized_completion_lr,
+            lambda_completion_calibration=args.kernelized_completion_lambda_completion,
+            lambda_component_calibration=args.kernelized_completion_lambda_components,
+            lambda_min_completion=args.kernelized_completion_lambda_min,
+            lambda_rkhs=args.kernelized_completion_lambda_rkhs,
+            seed=seed,
+        ),
+        device=device,
+    )
+    non_interactive_result = estimate_non_interactive_completion_pid(
+        x1_train,
+        x2_train,
+        y_train,
+        num_labels=num_labels,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        config=NonInteractiveCompletionConfig(
+            hidden_dim=args.non_interactive_hidden_dim,
+            additive_hidden_dim=args.non_interactive_additive_hidden_dim,
+            predictor_model=args.non_interactive_predictor_model,
+            additive_model=args.non_interactive_additive_model,
+            batch_size=args.surrogate_batch_size,
+            predictor_epochs=args.non_interactive_predictor_epochs,
+            additive_epochs=args.non_interactive_additive_epochs,
+            predictor_lr=args.non_interactive_predictor_lr,
+            additive_lr=args.non_interactive_additive_lr,
+            kernel_gamma=args.non_interactive_kernel_gamma,
+            kernel_ridge_lambda=args.non_interactive_kernel_ridge_lambda,
+            additive_feasibility_lambda=args.non_interactive_additive_feasibility_lambda,
+            additive_rkhs_lambda=args.non_interactive_additive_rkhs_lambda,
+            additive_anchor_lambda=args.non_interactive_additive_anchor_lambda,
+            calibration_blocks=args.surrogate_calibration_blocks,
+            seed=seed,
+        ),
+        device=device,
+    )
     return {
         "pid_ce_alignment": _components_to_dict(pid_result.mean_components),
         "lsmi": lsmi_result_dict,
@@ -360,6 +446,8 @@ def _run_estimators(
         "surrogate_uncertainty_mobius": _components_to_dict(surrogate_uncertainty_mobius_result.mean_components),
         "surrogate_kernel": _components_to_dict(surrogate_kernel_result.mean_components),
         "direct_kernel": _components_to_dict(direct_kernel_result.mean_components),
+        "kernelized_completion": _components_to_dict(kernelized_completion_result.mean_components),
+        "non_interactive_completion": _components_to_dict(non_interactive_result.mean_components),
     }
 
 
@@ -403,6 +491,16 @@ def _components_to_dict(components: torch.Tensor) -> dict[str, float]:
         "unique_1": float(values[1]),
         "unique_2": float(values[2]),
         "synergy": float(values[3]),
+    }
+
+
+def _analytic_logic_reference(x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+    result = estimate_discrete_bertschinger_pid(x1, x2, y)
+    return {
+        "redundancy": float(result["redundancy"]),
+        "unique_1": float(result["unique_1"]),
+        "unique_2": float(result["unique_2"]),
+        "synergy": float(result["synergy"]),
     }
 
 
@@ -512,6 +610,13 @@ def _to_markdown(*, device: str, payload: dict) -> str:
 
 def _format_rows(*, row_key: str, row: dict) -> list[str]:
     lines = []
+    if "analytic_reference" in row:
+        values = row["analytic_reference"]
+        lines.append(
+            f"| {row_key} | analytic-reference | "
+            f"{values['redundancy']:.4f} | {values['unique_1']:.4f} | "
+            f"{values['unique_2']:.4f} | {values['synergy']:.4f} | {_dominant_component(values)} |"
+        )
     for estimator_key, label in [
         ("pid_ce_alignment", "pid"),
         ("lsmi", "lsmi"),
@@ -520,6 +625,8 @@ def _format_rows(*, row_key: str, row: dict) -> list[str]:
         ("surrogate_uncertainty_mobius", "surrogate-uncertainty-mobius"),
         ("surrogate_kernel", "surrogate-kernel"),
         ("direct_kernel", "direct-kernel"),
+        ("kernelized_completion", "kernelized-completion"),
+        ("non_interactive_completion", "non-interactive-completion"),
     ]:
         values = row[estimator_key]
         dominant = _dominant_component(values)

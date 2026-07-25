@@ -41,11 +41,19 @@ SETTINGS = (
     ("random_data80_mod80", "random_grouped25_subset100_data80_mod80"),
     ("random_data90_mod90", "random_grouped25_subset100_data90_mod90"),
 )
-METHODS = ("metric_rbf", "structured_metric_rbf", "structured_rbf", "raw_flat_rbf", "linear_regression")
-ANCHOR_METHODS = ("structured_rbf", "structured_metric_rbf")
+METHODS = (
+    "metric_rbf",
+    "structured_metric_rbf",
+    "structured_rbf",
+    "sks",
+    "raw_flat_rbf",
+    "linear_regression",
+)
+ANCHOR_METHODS = ("structured_rbf", "sks", "structured_metric_rbf")
 RIDGE_GRID = (1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0)
 GAMMA_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0)
 SHARED_GRID = (0.0, 0.1, 0.5, 1.0, 2.0, 5.0)
+RHO_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 0.95)
 
 DEFAULT_RESULT_ROOT = ROOT / "src" / "kernel_surrogate" / "subset_results" / "lds_real_train"
 DEFAULT_OUTPUT_JSON = ROOT / "src" / "kernel_surrogate" / "results" / "compare_anchor_methods_top3.json"
@@ -61,6 +69,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
+    parser.add_argument("--settings", nargs="+", default=[name for name, _ in SETTINGS])
+    parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))
+    parser.add_argument("--anchor-methods", nargs="+", default=list(ANCHOR_METHODS), choices=list(METHODS))
     parser.add_argument("--seed", type=int, default=0, help="LDS artifact seed to load.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--feature-device", default=None)
@@ -108,7 +119,12 @@ def evaluate_method_grid(
     train_indices, test_indices = split_indices(len(targets), train_fraction=train_fraction, seed=split_seed)
     truth = targets[test_indices]
     gamma_values = (None,) if method == "linear_regression" else GAMMA_GRID
-    shared_values = SHARED_GRID if method in {"structured_metric_rbf", "structured_rbf"} else (None,)
+    if method in {"structured_metric_rbf", "structured_rbf"}:
+        shared_values = SHARED_GRID
+    elif method == "sks":
+        shared_values = RHO_GRID
+    else:
+        shared_values = (None,)
     method_metric = metric if method != "linear_regression" else np.eye(mask_blocks["flat_deleted"].shape[1], dtype=np.float64)
 
     best: dict[str, Any] | None = None
@@ -166,9 +182,10 @@ def summarize_top3(
     dataset: str,
     records: list[dict[str, Any]],
     top3_anchor_rows: list[dict[str, Any]],
+    methods: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     summaries = []
-    for method in METHODS:
+    for method in methods:
         values = []
         rows = []
         for anchor_row in top3_anchor_rows:
@@ -200,62 +217,72 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(str(args.device))
     split_seeds = [int(seed) for seed in args.split_seeds]
+    selected_settings = {str(item) for item in args.settings}
+    selected_methods = tuple(str(item) for item in args.methods)
+    anchor_methods = tuple(str(item) for item in args.anchor_methods if str(item) in set(selected_methods))
+    needs_metric = any(method in {"metric_rbf", "structured_metric_rbf"} for method in selected_methods)
     full_root = ROOT / "src" / "kernel_surrogate" / "subset_checkpoints" / "lds_real_train" / "grouped25_full_data_train"
 
     all_records: list[dict[str, Any]] = []
     for dataset in args.datasets:
         dataset = str(dataset)
         for setting, run_name in SETTINGS:
+            if setting not in selected_settings:
+                continue
             payload_path = args.result_root / run_name / f"{dataset}_seed{int(args.seed)}.json"
             if not payload_path.exists():
                 continue
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             config = dict(payload["config"])
-            print(f"[{dataset}/{setting}] loading data on {device}...", flush=True)
-            data = load_dataset(
-                dataset,
-                int(args.seed),
-                text_backbone=str(config.get("text_backbone", "clip_cached")),
-                vision_backbone=str(config.get("vision_backbone", "clip_cached")),
-                feature_device=str(args.feature_device or config.get("feature_device", device)),
-                backbone_batch_size=int(config.get("backbone_batch_size", 32)),
-                download_datasets=bool(config.get("download_datasets", False)),
-                backbone_cache_dir=config.get("backbone_cache_dir"),
-            )
-            model_args = make_model_args(config, device=str(device))
-            full_checkpoint = resolve_full_checkpoint_path(
-                dataset=dataset,
-                seed=int(args.seed),
-                pretrained_root=full_root,
-                fallback_dir=ROOT / "src" / "kernel_surrogate" / "full_checkpoints" / "real_data_cmis",
-            )
-            model, _ = load_or_train_full_model(
-                full_checkpoint,
-                data=data,
-                task=str(data["task"]),
-                dim_x=int(data["train_x"].shape[1]),
-                dim_y=int(data["train_y"].shape[1]),
-                num_classes=int(data["num_classes"]),
-                model_args=model_args,
-                model_type=str(config.get("model", "cross_attention")),
-                seed=int(args.seed),
-                force_train=False,
-            )
-            model.to(device)
-            model.eval()
-            gradients = compute_group_modality_gradients(
-                model,
-                data=data,
-                group_indices=payload["group_partition"]["group_indices"],
-                task=str(data["task"]),
-                device=str(device),
-                gradient_params=str(args.gradient_params),
-            )
-            metric, metric_stats = build_metric(gradients, normalization=str(args.metric_normalization))
             mask_blocks, targets = build_group_mask_blocks(payload)
+            if needs_metric:
+                print(f"[{dataset}/{setting}] loading data on {device}...", flush=True)
+                data = load_dataset(
+                    dataset,
+                    int(args.seed),
+                    text_backbone=str(config.get("text_backbone", "clip_cached")),
+                    vision_backbone=str(config.get("vision_backbone", "clip_cached")),
+                    feature_device=str(args.feature_device or config.get("feature_device", device)),
+                    backbone_batch_size=int(config.get("backbone_batch_size", 32)),
+                    download_datasets=bool(config.get("download_datasets", False)),
+                    backbone_cache_dir=config.get("backbone_cache_dir"),
+                )
+                model_args = make_model_args(config, device=str(device))
+                full_checkpoint = resolve_full_checkpoint_path(
+                    dataset=dataset,
+                    seed=int(args.seed),
+                    pretrained_root=full_root,
+                    fallback_dir=ROOT / "src" / "kernel_surrogate" / "full_checkpoints" / "real_data_cmis",
+                )
+                model, _ = load_or_train_full_model(
+                    full_checkpoint,
+                    data=data,
+                    task=str(data["task"]),
+                    dim_x=int(data["train_x"].shape[1]),
+                    dim_y=int(data["train_y"].shape[1]),
+                    num_classes=int(data["num_classes"]),
+                    model_args=model_args,
+                    model_type=str(config.get("model", "cross_attention")),
+                    seed=int(args.seed),
+                    force_train=False,
+                )
+                model.to(device)
+                model.eval()
+                gradients = compute_group_modality_gradients(
+                    model,
+                    data=data,
+                    group_indices=payload["group_partition"]["group_indices"],
+                    task=str(data["task"]),
+                    device=str(device),
+                    gradient_params=str(args.gradient_params),
+                )
+                metric, metric_stats = build_metric(gradients, normalization=str(args.metric_normalization))
+            else:
+                metric = np.eye(mask_blocks["flat_deleted"].shape[1], dtype=np.float64)
+                metric_stats = {"metric_source": "identity_unused"}
             for split_seed in split_seeds:
                 print(f"  split_seed={split_seed}", flush=True)
-                for method in METHODS:
+                for method in selected_methods:
                     row = evaluate_method_grid(
                         dataset=dataset,
                         setting=setting,
@@ -280,13 +307,13 @@ def main() -> None:
     for dataset in args.datasets:
         dataset = str(dataset)
         dataset_rows = [row for row in all_records if row["dataset"] == dataset]
-        for anchor_method in ANCHOR_METHODS:
+        for anchor_method in anchor_methods:
             anchor_candidates = [row for row in dataset_rows if row["method"] == anchor_method]
             top3_anchor_rows = choose_topk_unique_seeds(anchor_candidates, 3)
             if not top3_anchor_rows:
                 continue
             best_anchor = top3_anchor_rows[0]
-            for method in METHODS:
+            for method in selected_methods:
                 matched = next(
                     row
                     for row in dataset_rows
@@ -312,15 +339,16 @@ def main() -> None:
                     dataset=dataset,
                     records=dataset_rows,
                     top3_anchor_rows=top3_anchor_rows,
+                    methods=selected_methods,
                 )
             )
 
     payload = {
         "config": {
             "datasets": [str(item) for item in args.datasets],
-            "settings": [name for name, _ in SETTINGS],
-            "methods": list(METHODS),
-            "anchor_methods": list(ANCHOR_METHODS),
+            "settings": [name for name, _ in SETTINGS if name in selected_settings],
+            "methods": list(selected_methods),
+            "anchor_methods": list(anchor_methods),
             "split": f"{float(args.train_fraction):.6g}/{1.0 - float(args.train_fraction):.6g}",
             "split_seeds": split_seeds,
             "metric_normalization": str(args.metric_normalization),
@@ -340,6 +368,7 @@ def main() -> None:
 
 
 def to_markdown(payload: dict[str, Any]) -> str:
+    anchor_methods = [str(method) for method in payload["config"]["anchor_methods"]]
     lines = [
         "# Compare Anchors By Top Seed And Top-3 Seeds",
         "",
@@ -347,7 +376,7 @@ def to_markdown(payload: dict[str, Any]) -> str:
         f"- split seeds: `{payload['config']['split_seeds']}`",
         f"- metric: held-out Spearman LDS",
     ]
-    for anchor_method in ANCHOR_METHODS:
+    for anchor_method in anchor_methods:
         lines.extend(
             [
                 "",
