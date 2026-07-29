@@ -1,2 +1,0 @@
-"""Kernel-surrogate training utilities."""
-
