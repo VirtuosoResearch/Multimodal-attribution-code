@@ -7,6 +7,8 @@ We provide the implementation of Designing Kernel Surrogate Models for Multimoda
 The review code exposes the attribution/data-selection workflow through three
 small entry points under `src/attribution`.
 
+The Python version in our experiments is `3.10`. We also provide the package requirements in `requirements.txt`.
+
 Two launch scripts are provided:
 
 ```bash
