@@ -15,12 +15,12 @@ if [[ ! -d "${TRAFFIC_ROOT}/data" || ! -d "${TRAFFIC_ROOT}/embeddings" ]]; then
   exit 1
 fi
 
-# One-command LDS pipeline on DE:
-# 1) train subset models / save LDS payload
-# 2) run kernel attribution evaluation on saved LDS payload
+# One-command attribution pipeline:
+# 1) train subset models
+# 2) run attribution evaluation
 #
 # Usage:
-#   bash src/kernel_surrogate/scripts/run_full_lds_DE.sh [RUN_NAME]
+#   bash src/mmtrace/scripts/run_attribution.sh [RUN_NAME]
 
 RUN_NAME="${1:-traffic_de_gnnmlp_vit_grid_v2_group15_subset100_data060_mod060}"
 DATASET="${DATASET:-traffic_accident}"
@@ -45,9 +45,9 @@ EVAL_SEARCH_STRATEGY="${EVAL_SEARCH_STRATEGY:-validation}"
 EVAL_TRAIN_FRACTION="${EVAL_TRAIN_FRACTION:-0.7}"
 EVAL_VALIDATION_FRACTION="${EVAL_VALIDATION_FRACTION:-0.2}"
 
-RESULT_DIR="${REPO_ROOT}/src/kernel_surrogate/subset_results/lds_real_train/${RUN_NAME}"
-OUTPUT_JSON="${REPO_ROOT}/src/kernel_surrogate/results/kernel_attribution_lds_gnn_${RUN_NAME}.json"
-OUTPUT_MD="${REPO_ROOT}/src/kernel_surrogate/results/kernel_attribution_lds_gnn_${RUN_NAME}.md"
+RESULT_DIR="${REPO_ROOT}/src/mmtrace/subset_results/attribution/${RUN_NAME}"
+OUTPUT_JSON="${REPO_ROOT}/src/mmtrace/results/attribution_${RUN_NAME}.json"
+OUTPUT_MD="${REPO_ROOT}/src/mmtrace/results/attribution_${RUN_NAME}.md"
 
 read -r -a TRAIN_REPEAT_SEEDS_ARR <<< "${TRAIN_REPEAT_SEEDS}"
 EVAL_EXTRA_ARGS=()
@@ -58,9 +58,9 @@ if [[ "${EVAL_SEARCH_HYPERPARAMS}" == "1" ]]; then
   fi
 fi
 
-echo "[1/2] Training LDS subset models on DE..."
+echo "[1/2] Training subset models..."
 conda run --live-stream -n vlm env PYTHONPATH="${REPO_ROOT}" \
-python -m src.kernel_surrogate.lds_real_train_gnn \
+python -m src.mmtrace.attribution \
   --model traffic_pair_gnn_mlp \
   --datasets "${DATASET}" \
   --seeds "${SEED}" \
@@ -81,13 +81,13 @@ python -m src.kernel_surrogate.lds_real_train_gnn \
   --run-name "${RUN_NAME}"
 
 if [[ ! -d "${RESULT_DIR}" ]]; then
-  echo "Missing LDS result directory after training: ${RESULT_DIR}" >&2
+  echo "Missing attribution result directory: ${RESULT_DIR}" >&2
   exit 1
 fi
 
-echo "[2/2] Running LDS attribution evaluation..."
+echo "[2/2] Running attribution evaluation..."
 conda run --live-stream -n vlm env PYTHONPATH="${REPO_ROOT}" \
-python -m src.kernel_surrogate.evaluate_kernel_attribution_gnn \
+python -m src.mmtrace.evaluate_kernel_attribution_gnn \
   --result-dir "${RESULT_DIR}" \
   --datasets "${DATASET}" \
   --seeds "${SEED}" \
@@ -98,5 +98,5 @@ python -m src.kernel_surrogate.evaluate_kernel_attribution_gnn \
   --output-md "${OUTPUT_MD}"
 
 echo "Done."
-echo "LDS payload dir: ${RESULT_DIR}"
+echo "Attribution result dir: ${RESULT_DIR}"
 echo "Attribution JSON: ${OUTPUT_JSON}"

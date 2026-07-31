@@ -8,9 +8,6 @@ cd "${REPO_ROOT}"
 # One-command downstream evaluation on DE using an existing LDS run_name.
 # Default method here is structured RBF graph selection:
 # keep 30% graph groups, keep all vision data, retrain, then report test metrics.
-#
-# Usage:
-#   bash src/kernel_surrogate/scripts/run_full_downstream_DE.sh [RUN_NAME]
 
 RUN_NAME="${1:-traffic_de_gnnmlp_vit_grid_v2_group15_subset100_data060_mod060}"
 DATASET="${DATASET:-traffic_accident}"
@@ -26,20 +23,19 @@ SURROGATE_TRAIN_FRACTION="${SURROGATE_TRAIN_FRACTION:-1.0}"
 SURROGATE_SPLIT_SEED="${SURROGATE_SPLIT_SEED:-0}"
 RUN_FULL_BASELINE="${RUN_FULL_BASELINE:-1}"
 
-RESULT_DIR="${REPO_ROOT}/src/kernel_surrogate/subset_results/lds_real_train"
-RESULTS_OUT_DIR="${REPO_ROOT}/src/kernel_surrogate/results"
+RESULT_DIR="${REPO_ROOT}/src/mmtrace/subset_results/selection"
+RESULTS_OUT_DIR="${REPO_ROOT}/src/mmtrace/results"
 mkdir -p "${RESULTS_OUT_DIR}"
 
 if [[ ! -d "${RESULT_DIR}/${RUN_NAME}" ]]; then
-  echo "Missing LDS result run directory: ${RESULT_DIR}/${RUN_NAME}" >&2
-  echo "Run LDS first with: bash src/kernel_surrogate/scripts/run_full_lds_DE.sh ${RUN_NAME}" >&2
+  echo "Missing selection result run directory: ${RESULT_DIR}/${RUN_NAME}" >&2
   exit 1
 fi
 
 keep_tag="$(printf '%.2f' "${KEEP_GRAPH_GROUP_RATIO}" | sed 's/\.//')"
 OUT_TAG="${RUN_NAME}_keepg${keep_tag}_s${SEED}_ts${TRAIN_SEED}"
-OUTPUT_JSON="${RESULTS_OUT_DIR}/downstream_graph_structured_${OUT_TAG}.json"
-OUTPUT_MD="${RESULTS_OUT_DIR}/downstream_graph_structured_${OUT_TAG}.md"
+OUTPUT_JSON="${RESULTS_OUT_DIR}/selection_${OUT_TAG}.json"
+OUTPUT_MD="${RESULTS_OUT_DIR}/selection_${OUT_TAG}.md"
 
 EXTRA_ARGS=()
 if [[ "${RUN_FULL_BASELINE}" == "1" ]]; then
@@ -47,7 +43,7 @@ if [[ "${RUN_FULL_BASELINE}" == "1" ]]; then
 fi
 
 conda run --live-stream -n vlm env PYTHONPATH="${REPO_ROOT}" \
-python -m src.kernel_surrogate.downstream_structured_rbf_graph \
+python -m src.mmtrace.selection \
   --result-dir "${RESULT_DIR}" \
   --run-name "${RUN_NAME}" \
   --dataset "${DATASET}" \
@@ -65,4 +61,4 @@ python -m src.kernel_surrogate.downstream_structured_rbf_graph \
   --output-md "${OUTPUT_MD}"
 
 echo "Done."
-echo "Downstream JSON: ${OUTPUT_JSON}"
+echo "Selection JSON: ${OUTPUT_JSON}"

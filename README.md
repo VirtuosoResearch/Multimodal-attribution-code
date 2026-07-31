@@ -9,11 +9,17 @@ small entry points under `src/attribution`.
 
 The Python version in our experiments is `3.10`. We also provide the package requirements in `requirements.txt`.
 
-Two launch scripts are provided:
+Two launch scripts are provided for both MultiBench and MMTraCE:
 
 ```bash
+# MultiBench
 bash scripts/run_attribution.sh avmnist
 bash scripts/run_selection.sh avmnist
+
+# MMTraCE
+cd ./src/mmtrace
+bash scripts/run_attribution.sh
+bash scripts/run_selection.sh
 ```
 
 The dataset is the first script argument. `RUN_NAME` defaults to the dataset
